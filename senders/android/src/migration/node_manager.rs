@@ -82,10 +82,7 @@ impl NodeRecord {
                 node.schedule(cue_time, end_time);
                 Ok(())
             }
-            Self::VideoGenerator(node) => {
-                node.schedule(cue_time, end_time);
-                Ok(())
-            }
+            Self::VideoGenerator(node) => node.schedule(cue_time, end_time),
         }
     }
 

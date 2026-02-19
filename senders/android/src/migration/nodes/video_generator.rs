@@ -1,5 +1,6 @@
 use crate::migration::protocol::{NodeInfo, SourceInfo, State};
 use chrono::{DateTime, Duration, Utc};
+use gst::prelude::*;
 use std::collections::BTreeSet;
 
 const PREROLL_LEAD_TIME_SECONDS: i64 = 10;
@@ -18,6 +19,11 @@ pub struct VideoGeneratorPipelineProfile {
     pub is_live: bool,
     pub flip: bool,
     pub stage: VideoGeneratorStage,
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveVideoGeneratorPipeline {
+    pub pipeline: gst::Pipeline,
 }
 
 impl VideoGeneratorPipelineProfile {
@@ -47,10 +53,15 @@ pub struct VideoGeneratorNode {
     pub end_time: Option<DateTime<Utc>>,
     pub state: State,
     pub pipeline: VideoGeneratorPipelineProfile,
+    pub live_pipeline: Option<LiveVideoGeneratorPipeline>,
     pub last_error: Option<String>,
 }
 
 impl VideoGeneratorNode {
+    fn gst_initialized() -> bool {
+        unsafe { gst::ffi::gst_is_initialized() != 0 }
+    }
+
     pub fn new(id: String) -> Self {
         Self {
             id,
@@ -62,7 +73,90 @@ impl VideoGeneratorNode {
             end_time: None,
             state: State::Initial,
             pipeline: VideoGeneratorPipelineProfile::new(),
+            live_pipeline: None,
             last_error: None,
+        }
+    }
+
+    fn make_element(element: &str, name: &str) -> Result<gst::Element, String> {
+        gst::ElementFactory::make(element)
+            .name(name)
+            .build()
+            .map_err(|err| format!("Failed to create element `{element}`: {}", &*err.message))
+    }
+
+    fn build_live_pipeline(id: &str, profile: &VideoGeneratorPipelineProfile) -> Result<LiveVideoGeneratorPipeline, String> {
+        let pipeline = gst::Pipeline::with_name(&format!("migration-videogen-{id}"));
+
+        let src = Self::make_element("videotestsrc", &format!("videogen-src-{id}"))?;
+        src.set_property("flip", profile.flip);
+        src.set_property("is-live", profile.is_live);
+        src.set_property_from_str("pattern", &profile.pattern);
+
+        let deinterlace = Self::make_element("deinterlace", &format!("videogen-deinterlace-{id}"))?;
+        let appsink = Self::make_element("appsink", &format!("videogen-appsink-{id}"))?;
+
+        pipeline
+            .add(&src)
+            .map_err(|err| format!("Failed to add videotestsrc to video generator pipeline: {err:?}"))?;
+        pipeline
+            .add(&deinterlace)
+            .map_err(|err| format!("Failed to add deinterlace to video generator pipeline: {err:?}"))?;
+        pipeline
+            .add(&appsink)
+            .map_err(|err| format!("Failed to add appsink to video generator pipeline: {err:?}"))?;
+
+        src.link(&deinterlace)
+            .map_err(|err| format!("Failed to link videotestsrc->deinterlace: {err:?}"))?;
+        deinterlace
+            .link(&appsink)
+            .map_err(|err| format!("Failed to link deinterlace->appsink: {err:?}"))?;
+
+        Ok(LiveVideoGeneratorPipeline { pipeline })
+    }
+
+    fn teardown_live_pipeline(&mut self) {
+        if let Some(live) = self.live_pipeline.take() {
+            let _ = live.pipeline.set_state(gst::State::Null);
+        }
+    }
+
+    fn ensure_live_pipeline(&mut self) -> Result<(), String> {
+        if self.live_pipeline.is_some() {
+            return Ok(());
+        }
+
+        self.live_pipeline = Some(Self::build_live_pipeline(&self.id, &self.pipeline)?);
+        Ok(())
+    }
+
+    fn sync_live_pipeline(&mut self) -> Result<(), String> {
+        // Unit tests and host-only flows may call migration code before GStreamer init.
+        if !Self::gst_initialized() {
+            return Ok(());
+        }
+
+        match self.pipeline.stage {
+            VideoGeneratorStage::Idle => {
+                self.teardown_live_pipeline();
+                Ok(())
+            }
+            VideoGeneratorStage::Prerolling | VideoGeneratorStage::Playing => {
+                self.ensure_live_pipeline()?;
+                let target_state = if self.pipeline.stage == VideoGeneratorStage::Prerolling {
+                    gst::State::Paused
+                } else {
+                    gst::State::Playing
+                };
+
+                if let Some(live) = self.live_pipeline.as_ref() {
+                    live.pipeline
+                        .set_state(target_state)
+                        .map_err(|err| format!("Failed to set video generator pipeline state to {target_state:?}: {err:?}"))?;
+                }
+
+                Ok(())
+            }
         }
     }
 
@@ -80,7 +174,11 @@ impl VideoGeneratorNode {
         self.video_consumer_slot_ids.remove(link_id);
     }
 
-    pub fn schedule(&mut self, cue_time: Option<DateTime<Utc>>, end_time: Option<DateTime<Utc>>) {
+    pub fn schedule(
+        &mut self,
+        cue_time: Option<DateTime<Utc>>,
+        end_time: Option<DateTime<Utc>>,
+    ) -> Result<(), String> {
         self.cue_time = cue_time;
         self.end_time = end_time;
         self.last_error = None;
@@ -105,9 +203,20 @@ impl VideoGeneratorNode {
                 State::Started
             }
         };
+
+        if let Err(err) = self.sync_live_pipeline() {
+            self.last_error = Some(err.clone());
+            self.pipeline.stage = VideoGeneratorStage::Idle;
+            self.state = State::Stopped;
+            self.teardown_live_pipeline();
+            return Err(err);
+        }
+
+        Ok(())
     }
 
     pub fn stop(&mut self) {
+        self.teardown_live_pipeline();
         self.pipeline.stage = VideoGeneratorStage::Idle;
         self.state = State::Stopped;
     }

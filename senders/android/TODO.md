@@ -70,6 +70,9 @@ Migrate the old `old-version/rust-android-examples/agdk-eframe/src` command API 
 - [x] Port mixer control-point timeline behavior (`set` + numeric `interpolate`) and slot application.
 - [x] Port destination family-specific pipeline profile modeling and start precondition checks.
 - [x] Wire Java helper path to call `nativeGraphCommand` and parse `success`/`error`/`info` responses.
+- [x] Add concrete Java call site (`getinfo`) in app flow and parse/log response.
+- [x] Add concrete Java smoke sequence (`createvideogenerator` + `createmixer` + `connect` + `start` + `getinfo`, with cleanup).
+- [x] Start live GStreamer execution in migration runtime for `VideoGeneratorNode` (create/link/state transitions).
 - [ ] Replace modeled node profiles with live GStreamer pipeline execution.
 - [ ] Port EOS and async bus transition behavior from old `domain/nodes/*`.
 
