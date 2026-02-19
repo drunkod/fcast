@@ -1,0 +1,95 @@
+name: Android APK Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-android-apk:
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            pkg-config \
+            automake \
+            autoconf \
+            libtool \
+            libprotobuf-dev \
+            protobuf-compiler \
+            unzip \
+            xz-utils \
+            wget \
+            curl \
+            ninja-build \
+            libclang-dev
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Add Android Rust targets
+        run: |
+          rustup target add \
+            aarch64-linux-android \
+            armv7-linux-androideabi \
+            x86_64-linux-android \
+            i686-linux-android
+
+      - name: Download Android SDK, NDK, and GStreamer
+        run: |
+          cargo xtask android download-sdk
+          cargo xtask android download-ndk
+          cargo xtask android download-gstreamer
+
+      - name: Build GStreamer Android glue
+        run: cargo xtask sender android build-lib-gst
+
+      - name: Build Rust Android library
+        run: cargo xtask sender android build --release
+
+      - name: Build release APK
+        working-directory: senders/android
+        run: ./gradlew --no-daemon assembleRelease
+
+      - name: Prepare APK artifact
+        id: prepare_apk
+        run: |
+          TAG_NAME="${{ github.event.release.tag_name || github.ref_name }}"
+          APK_IN="senders/android/app/build/outputs/apk/release/app-release-unsigned.apk"
+          APK_OUT="senders/android/app/build/outputs/apk/release/fcast-sender-${TAG_NAME}-release-unsigned.apk"
+          cp "$APK_IN" "$APK_OUT"
+          echo "apk_path=$APK_OUT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk-release
+          path: ${{ steps.prepare_apk.outputs.apk_path }}
+
+      - name: Attach APK to GitHub Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.prepare_apk.outputs.apk_path }}
