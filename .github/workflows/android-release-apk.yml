@@ -61,6 +61,7 @@ jobs:
       - name: Export Android toolchain paths
         run: |
           echo "ANDROID_HOME=$GITHUB_WORKSPACE/thirdparty/Android/Sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$GITHUB_WORKSPACE/thirdparty/Android/Sdk" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$GITHUB_WORKSPACE/thirdparty/android-ndk-r25c" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$GITHUB_WORKSPACE/thirdparty/android-ndk-r25c" >> "$GITHUB_ENV"
           echo "ANDROID_NDK=$GITHUB_WORKSPACE/thirdparty/android-ndk-r25c" >> "$GITHUB_ENV"
