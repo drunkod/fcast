@@ -1,3 +1,4 @@
+pub(crate) mod control;
 pub mod destination;
 pub mod mixer;
 pub mod source;

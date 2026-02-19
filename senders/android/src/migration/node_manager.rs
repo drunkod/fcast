@@ -1,6 +1,6 @@
 use crate::migration::{
     nodes::{DestinationNode, MixerNode, SourceNode, VideoGeneratorNode},
-    protocol::{Command, CommandResult, ControlPoint, Info, NodeInfo, State},
+    protocol::{Command, CommandResult, ControlPoint, Info, NodeInfo},
 };
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -71,13 +71,39 @@ impl NodeRecord {
         &mut self,
         cue_time: Option<DateTime<Utc>>,
         end_time: Option<DateTime<Utc>>,
-        state: State,
-    ) {
+    ) -> Result<(), String> {
         match self {
-            Self::Source(node) => node.set_schedule(cue_time, end_time, state),
-            Self::Destination(node) => node.set_schedule(cue_time, end_time, state),
-            Self::Mixer(node) => node.set_schedule(cue_time, end_time, state),
-            Self::VideoGenerator(node) => node.set_schedule(cue_time, end_time, state),
+            Self::Source(node) => {
+                node.schedule(cue_time, end_time);
+                Ok(())
+            }
+            Self::Destination(node) => node.schedule(cue_time, end_time),
+            Self::Mixer(node) => {
+                node.schedule(cue_time, end_time);
+                Ok(())
+            }
+            Self::VideoGenerator(node) => {
+                node.schedule(cue_time, end_time);
+                Ok(())
+            }
+        }
+    }
+
+    fn stop(&mut self) {
+        match self {
+            Self::Source(node) => node.stop(),
+            Self::Destination(node) => node.stop(),
+            Self::Mixer(node) => node.stop(),
+            Self::VideoGenerator(node) => node.stop(),
+        }
+    }
+
+    fn mark_error(&mut self, message: String) {
+        match self {
+            Self::Source(node) => node.mark_error(message),
+            Self::Destination(node) => node.mark_error(message),
+            Self::Mixer(node) => node.mark_error(message),
+            Self::VideoGenerator(node) => node.mark_error(message),
         }
     }
 
@@ -258,10 +284,11 @@ impl NodeManager {
             ));
         }
 
-        self.nodes.insert(
-            id.clone(),
-            NodeRecord::Mixer(MixerNode::new(id, config, audio, video)),
-        );
+        let node = match MixerNode::new(id.clone(), config, audio, video) {
+            Ok(node) => node,
+            Err(err) => return CommandResult::Error(err),
+        };
+        self.nodes.insert(id, NodeRecord::Mixer(node));
         CommandResult::Success
     }
 
@@ -304,8 +331,7 @@ impl NodeManager {
         let sink_update = match self.nodes.get_mut(&sink_id) {
             Some(NodeRecord::Destination(dest)) => dest.connect_input(&link_id, audio, video),
             Some(NodeRecord::Mixer(mixer)) => {
-                mixer.connect_input_slot(&link_id, audio, video, config.clone());
-                Ok(())
+                mixer.connect_input_slot(&link_id, audio, video, config.clone())
             }
             Some(NodeRecord::Source(_)) | Some(NodeRecord::VideoGenerator(_)) => {
                 Err(format!("Node {sink_id} is not a consumer"))
@@ -364,17 +390,21 @@ impl NodeManager {
             return CommandResult::Error(format!("No node with id {id}"));
         };
 
-        let state = match cue_time {
-            Some(cue) if cue > Utc::now() => State::Starting,
-            _ => State::Started,
-        };
-        node.set_schedule(cue_time, end_time, state);
+        if let Err(err) = node.set_schedule(cue_time, end_time) {
+            node.mark_error(err.clone());
+            return CommandResult::Error(err);
+        }
+
         CommandResult::Success
     }
 
     fn remove_node(&mut self, id: &str) -> CommandResult {
         if !self.nodes.contains_key(id) {
             return CommandResult::Error(format!("No node with id {id}"));
+        }
+
+        if let Some(node) = self.nodes.get_mut(id) {
+            node.stop();
         }
 
         let link_ids = self
@@ -431,8 +461,10 @@ impl NodeManager {
             };
 
             if let NodeRecord::Mixer(mixer) = node {
-                mixer.add_slot_control_point(controllee_id, property, control_point);
-                return CommandResult::Success;
+                return match mixer.add_slot_control_point(controllee_id, property, control_point) {
+                    Ok(()) => CommandResult::Success,
+                    Err(err) => CommandResult::Error(err),
+                };
             }
 
             return CommandResult::Error(format!(
@@ -446,8 +478,10 @@ impl NodeManager {
         };
 
         if let NodeRecord::Mixer(mixer) = node {
-            mixer.add_control_point(property, control_point);
-            return CommandResult::Success;
+            return match mixer.add_control_point(property, control_point) {
+                Ok(()) => CommandResult::Success,
+                Err(err) => CommandResult::Error(err),
+            };
         }
 
         CommandResult::Error(format!(

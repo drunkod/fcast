@@ -1,8 +1,8 @@
 # Android Sender Migration TODO
 
 ## Goal
-Migrate the old `agdk-eframe/src` command API + media-graph control model into
-`senders/android`, while keeping existing Android sender capture/casting flows working.
+Migrate the old `old-version/rust-android-examples/agdk-eframe/src` command API + media-graph control model into
+`senders/android/src`, while keeping existing Android sender capture/casting flows working.
 
 ## Scope
 - In scope:
@@ -65,8 +65,17 @@ Migrate the old `agdk-eframe/src` command API + media-graph control model into
 - [ ] Run Android device smoke test with JNI command ingress.
 - [ ] Validate compatibility against legacy controller client scripts.
 
+## Phase 6: True Media Parity (In Progress)
+- [x] Port old node scheduling/state behavior into new `nodes/*` runtime models.
+- [x] Port mixer control-point timeline behavior (`set` + numeric `interpolate`) and slot application.
+- [x] Port destination family-specific pipeline profile modeling and start precondition checks.
+- [x] Wire Java helper path to call `nativeGraphCommand` and parse `success`/`error`/`info` responses.
+- [ ] Replace modeled node profiles with live GStreamer pipeline execution.
+- [ ] Port EOS and async bus transition behavior from old `domain/nodes/*`.
+
 ## Risks / Follow-ups
-- [ ] Replace metadata-only node internals with real GStreamer pipeline behavior from old `domain/nodes/*`.
+- [x] Replace metadata-only node internals with richer parity runtime models from old `domain/nodes/*`.
+- [ ] Replace runtime models with real GStreamer pipeline behavior from old `domain/nodes/*`.
 - [ ] Add scheduled execution and EOS behavior parity.
 - [ ] Add remote transport endpoint for command ingress if needed (`/command` equivalent).
-- [ ] Map all old mixer/source slot property semantics to runtime behavior.
+- [ ] Map remaining old mixer/source slot property semantics to runtime behavior.

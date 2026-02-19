@@ -35,6 +35,8 @@ import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 import com.journeyapps.barcodescanner.ScanOptions;
 
 import org.freedesktop.gstreamer.GStreamer;
+import org.json.JSONException;
+import org.json.JSONObject;
 
 import java.net.Inet6Address;
 import java.net.InetAddress;
@@ -844,7 +846,80 @@ public class MainActivity extends NativeActivity implements DisplayManager.Displ
         }
     }
 
+    public static final class GraphCommandResponse {
+        public final boolean success;
+        public final String error;
+        public final JSONObject info;
+        public final JSONObject raw;
+
+        private GraphCommandResponse(boolean success, String error, JSONObject info, JSONObject raw) {
+            this.success = success;
+            this.error = error;
+            this.info = info;
+            this.raw = raw;
+        }
+
+        public static GraphCommandResponse success(JSONObject info, JSONObject raw) {
+            return new GraphCommandResponse(true, null, info, raw);
+        }
+
+        public static GraphCommandResponse error(String error, JSONObject raw) {
+            return new GraphCommandResponse(false, error, null, raw);
+        }
+    }
+
+    public GraphCommandResponse graphCommand(String payloadJson) {
+        String responseJson = nativeGraphCommand(payloadJson == null ? "" : payloadJson);
+        return parseGraphCommandResponse(responseJson);
+    }
+
+    public GraphCommandResponse graphCommand(JSONObject payload) {
+        return graphCommand(payload == null ? "" : payload.toString());
+    }
+
+    private GraphCommandResponse parseGraphCommandResponse(String responseJson) {
+        if (responseJson == null || responseJson.isEmpty()) {
+            return GraphCommandResponse.error("Empty graph command response", null);
+        }
+
+        try {
+            JSONObject root = new JSONObject(responseJson);
+            Object result = root.opt("result");
+            if (result instanceof String) {
+                String resultName = (String) result;
+                if ("success".equals(resultName)) {
+                    return GraphCommandResponse.success(null, root);
+                }
+                return GraphCommandResponse.error(
+                        "Unexpected graph result string: " + resultName,
+                        root
+                );
+            }
+
+            if (result instanceof JSONObject) {
+                JSONObject resultObject = (JSONObject) result;
+                if (resultObject.has("error")) {
+                    return GraphCommandResponse.error(
+                            resultObject.optString("error", "Unknown graph command error"),
+                            root
+                    );
+                }
+                if (resultObject.has("info")) {
+                    JSONObject info = resultObject.optJSONObject("info");
+                    return GraphCommandResponse.success(info, root);
+                }
+            }
+
+            return GraphCommandResponse.error("Unsupported graph result shape", root);
+        } catch (JSONException e) {
+            Log.e(TAG, "Failed to parse graph command response: " + responseJson, e);
+            return GraphCommandResponse.error("Invalid graph response JSON: " + e.getMessage(), null);
+        }
+    }
+
     native void nativeProcessFrame(int width, int height, ByteBuffer bufferY, ByteBuffer bufferU, ByteBuffer bufferV);
+
+    native String nativeGraphCommand(String payloadJson);
 
     native void nativeCaptureStarted();
 

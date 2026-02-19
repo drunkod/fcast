@@ -1,6 +1,42 @@
 use crate::migration::protocol::{NodeInfo, SourceInfo, State};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use std::collections::BTreeSet;
+
+const PREROLL_LEAD_TIME_SECONDS: i64 = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourcePipelineStage {
+    Idle,
+    Prerolling,
+    Playing,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourcePipelineProfile {
+    pub uri: String,
+    pub manual_unblock: bool,
+    pub immediate_fallback: bool,
+    pub elements: Vec<String>,
+    pub stage: SourcePipelineStage,
+}
+
+impl SourcePipelineProfile {
+    fn new(uri: String) -> Self {
+        Self {
+            uri,
+            manual_unblock: true,
+            immediate_fallback: true,
+            elements: vec![
+                "fallbacksrc".to_string(),
+                "deinterlace".to_string(),
+                "audioconvert".to_string(),
+                "level".to_string(),
+                "appsink".to_string(),
+            ],
+            stage: SourcePipelineStage::Idle,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SourceNode {
@@ -13,13 +49,15 @@ pub struct SourceNode {
     pub cue_time: Option<DateTime<Utc>>,
     pub end_time: Option<DateTime<Utc>>,
     pub state: State,
+    pub pipeline: SourcePipelineProfile,
+    pub last_error: Option<String>,
 }
 
 impl SourceNode {
     pub fn new(id: String, uri: String, audio_enabled: bool, video_enabled: bool) -> Self {
         Self {
             id,
-            uri,
+            uri: uri.clone(),
             audio_enabled,
             video_enabled,
             audio_consumer_slot_ids: BTreeSet::new(),
@@ -27,6 +65,8 @@ impl SourceNode {
             cue_time: None,
             end_time: None,
             state: State::Initial,
+            pipeline: SourcePipelineProfile::new(uri),
+            last_error: None,
         }
     }
 
@@ -44,15 +84,44 @@ impl SourceNode {
         self.video_consumer_slot_ids.remove(link_id);
     }
 
-    pub fn set_schedule(
-        &mut self,
-        cue_time: Option<DateTime<Utc>>,
-        end_time: Option<DateTime<Utc>>,
-        state: State,
-    ) {
+    /// Mirrors old source scheduling semantics:
+    /// - Initial until `cue - 10s`
+    /// - Starting between `cue - 10s` and `cue` (preroll)
+    /// - Started at/after `cue` (unblocked/playing)
+    pub fn schedule(&mut self, cue_time: Option<DateTime<Utc>>, end_time: Option<DateTime<Utc>>) {
         self.cue_time = cue_time;
         self.end_time = end_time;
-        self.state = state;
+        self.last_error = None;
+
+        let now = Utc::now();
+        self.state = match cue_time {
+            Some(cue) => {
+                let preroll_at = cue - Duration::seconds(PREROLL_LEAD_TIME_SECONDS);
+                if now < preroll_at {
+                    self.pipeline.stage = SourcePipelineStage::Idle;
+                    State::Initial
+                } else if now < cue {
+                    self.pipeline.stage = SourcePipelineStage::Prerolling;
+                    State::Starting
+                } else {
+                    self.pipeline.stage = SourcePipelineStage::Playing;
+                    State::Started
+                }
+            }
+            None => {
+                self.pipeline.stage = SourcePipelineStage::Playing;
+                State::Started
+            }
+        };
+    }
+
+    pub fn stop(&mut self) {
+        self.pipeline.stage = SourcePipelineStage::Idle;
+        self.state = State::Stopped;
+    }
+
+    pub fn mark_error(&mut self, message: String) {
+        self.last_error = Some(message);
     }
 
     pub fn as_info(&self) -> NodeInfo {

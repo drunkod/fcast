@@ -19,9 +19,15 @@
             default = pkgs.mkShell {
               buildInputs = with pkgs; [
                 rustup
+                cargo-ndk
                 pkg-config
                 openssl
                 android-tools
+                wget
+                unzip
+                gnutar
+                gnumake
+                jdk17_headless
                 gst.gstreamer
                 gst.gst-plugins-base
                 gst.gst-plugins-good

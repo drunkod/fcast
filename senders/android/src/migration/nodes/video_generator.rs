@@ -1,6 +1,40 @@
 use crate::migration::protocol::{NodeInfo, SourceInfo, State};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use std::collections::BTreeSet;
+
+const PREROLL_LEAD_TIME_SECONDS: i64 = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoGeneratorStage {
+    Idle,
+    Prerolling,
+    Playing,
+}
+
+#[derive(Debug, Clone)]
+pub struct VideoGeneratorPipelineProfile {
+    pub elements: Vec<String>,
+    pub pattern: String,
+    pub is_live: bool,
+    pub flip: bool,
+    pub stage: VideoGeneratorStage,
+}
+
+impl VideoGeneratorPipelineProfile {
+    fn new() -> Self {
+        Self {
+            elements: vec![
+                "videotestsrc".to_string(),
+                "deinterlace".to_string(),
+                "appsink".to_string(),
+            ],
+            pattern: "ball".to_string(),
+            is_live: true,
+            flip: true,
+            stage: VideoGeneratorStage::Idle,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct VideoGeneratorNode {
@@ -12,6 +46,8 @@ pub struct VideoGeneratorNode {
     pub cue_time: Option<DateTime<Utc>>,
     pub end_time: Option<DateTime<Utc>>,
     pub state: State,
+    pub pipeline: VideoGeneratorPipelineProfile,
+    pub last_error: Option<String>,
 }
 
 impl VideoGeneratorNode {
@@ -25,6 +61,8 @@ impl VideoGeneratorNode {
             cue_time: None,
             end_time: None,
             state: State::Initial,
+            pipeline: VideoGeneratorPipelineProfile::new(),
+            last_error: None,
         }
     }
 
@@ -42,15 +80,40 @@ impl VideoGeneratorNode {
         self.video_consumer_slot_ids.remove(link_id);
     }
 
-    pub fn set_schedule(
-        &mut self,
-        cue_time: Option<DateTime<Utc>>,
-        end_time: Option<DateTime<Utc>>,
-        state: State,
-    ) {
+    pub fn schedule(&mut self, cue_time: Option<DateTime<Utc>>, end_time: Option<DateTime<Utc>>) {
         self.cue_time = cue_time;
         self.end_time = end_time;
-        self.state = state;
+        self.last_error = None;
+
+        let now = Utc::now();
+        self.state = match cue_time {
+            Some(cue) => {
+                let preroll_at = cue - Duration::seconds(PREROLL_LEAD_TIME_SECONDS);
+                if now < preroll_at {
+                    self.pipeline.stage = VideoGeneratorStage::Idle;
+                    State::Initial
+                } else if now < cue {
+                    self.pipeline.stage = VideoGeneratorStage::Prerolling;
+                    State::Starting
+                } else {
+                    self.pipeline.stage = VideoGeneratorStage::Playing;
+                    State::Started
+                }
+            }
+            None => {
+                self.pipeline.stage = VideoGeneratorStage::Playing;
+                State::Started
+            }
+        };
+    }
+
+    pub fn stop(&mut self) {
+        self.pipeline.stage = VideoGeneratorStage::Idle;
+        self.state = State::Stopped;
+    }
+
+    pub fn mark_error(&mut self, message: String) {
+        self.last_error = Some(message);
     }
 
     // Old protocol has no dedicated VideoGenerator info variant.
