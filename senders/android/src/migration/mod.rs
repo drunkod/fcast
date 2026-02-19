@@ -1,3 +1,4 @@
+pub mod media_bridge;
 pub mod messages;
 pub mod node_manager;
 pub mod nodes;

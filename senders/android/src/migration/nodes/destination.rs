@@ -1,5 +1,7 @@
 use crate::migration::protocol::{DestinationFamily, DestinationInfo, NodeInfo, State};
 use chrono::{DateTime, Utc};
+use gst::prelude::*;
+use gst_app::AppSrc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DestinationPipelineStage {
@@ -14,6 +16,13 @@ pub struct DestinationPipelineProfile {
     pub elements: Vec<String>,
     pub wait_for_eos_on_stop: bool,
     pub stage: DestinationPipelineStage,
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveDestinationPipeline {
+    pub pipeline: gst::Pipeline,
+    pub video_appsrc: Option<AppSrc>,
+    pub audio_appsrc: Option<AppSrc>,
 }
 
 impl DestinationPipelineProfile {
@@ -100,10 +109,15 @@ pub struct DestinationNode {
     pub end_time: Option<DateTime<Utc>>,
     pub state: State,
     pub pipeline: Option<DestinationPipelineProfile>,
+    pub live_pipeline: Option<LiveDestinationPipeline>,
     pub last_error: Option<String>,
 }
 
 impl DestinationNode {
+    fn gst_initialized() -> bool {
+        unsafe { gst::ffi::gst_is_initialized() != 0 }
+    }
+
     pub fn new(
         id: String,
         family: DestinationFamily,
@@ -121,7 +135,492 @@ impl DestinationNode {
             end_time: None,
             state: State::Initial,
             pipeline: None,
+            live_pipeline: None,
             last_error: None,
+        }
+    }
+
+    fn make_element(element: &str, name: Option<&str>) -> Result<gst::Element, String> {
+        let factory = gst::ElementFactory::make(element);
+        let builder = match name {
+            Some(name) => factory.name(name),
+            None => factory,
+        };
+        builder
+            .build()
+            .map_err(|err| format!("Failed to create element `{element}`: {}", &*err.message))
+    }
+
+    fn make_appsrc(id: &str, media: &str) -> Result<AppSrc, String> {
+        let element =
+            Self::make_element("appsrc", Some(&format!("destination-{media}-appsrc-{id}")))?;
+        let appsrc = element
+            .downcast::<AppSrc>()
+            .map_err(|_| format!("Failed to downcast appsrc element for destination `{id}`"))?;
+        appsrc.set_property("is-live", true);
+        appsrc.set_property("do-timestamp", true);
+        appsrc.set_property_from_str("format", "time");
+        appsrc.set_property("block", false);
+        Ok(appsrc)
+    }
+
+    fn select_video_encoder(id: &str) -> Result<gst::Element, String> {
+        for encoder in ["nvh264enc", "x264enc", "openh264enc"] {
+            if let Ok(venc) = Self::make_element(encoder, Some(&format!("destination-venc-{id}"))) {
+                if venc.has_property("tune") {
+                    venc.set_property_from_str("tune", "zerolatency");
+                } else if venc.has_property("zerolatency") {
+                    venc.set_property("zerolatency", true);
+                }
+                if venc.has_property("key-int-max") {
+                    venc.set_property("key-int-max", 30u32);
+                } else if venc.has_property("gop-size") {
+                    venc.set_property("gop-size", 30i32);
+                }
+                return Ok(venc);
+            }
+        }
+        Err(
+            "Failed to create a H.264 video encoder (tried nvh264enc, x264enc, openh264enc)"
+                .to_string(),
+        )
+    }
+
+    fn build_live_pipeline(
+        &self,
+        _profile: &DestinationPipelineProfile,
+    ) -> Result<LiveDestinationPipeline, String> {
+        let pipeline = gst::Pipeline::with_name(&format!("migration-destination-{}", self.id));
+
+        let video_appsrc = if self.video_enabled {
+            let appsrc = Self::make_appsrc(&self.id, "video")?;
+            pipeline
+                .add(appsrc.upcast_ref::<gst::Element>())
+                .map_err(|err| {
+                    format!("Failed to add video appsrc to destination pipeline: {err:?}")
+                })?;
+            Some(appsrc)
+        } else {
+            None
+        };
+
+        let audio_appsrc = if self.audio_enabled {
+            let appsrc = Self::make_appsrc(&self.id, "audio")?;
+            pipeline
+                .add(appsrc.upcast_ref::<gst::Element>())
+                .map_err(|err| {
+                    format!("Failed to add audio appsrc to destination pipeline: {err:?}")
+                })?;
+            Some(appsrc)
+        } else {
+            None
+        };
+
+        match &self.family {
+            DestinationFamily::Rtmp { uri } => {
+                let mux = Self::make_element("flvmux", None)?;
+                let mux_queue = Self::make_element("queue", None)?;
+                let sink = Self::make_element("rtmp2sink", None)?;
+
+                pipeline.add(&mux).map_err(|err| {
+                    format!("Failed to add flvmux to destination pipeline: {err:?}")
+                })?;
+                pipeline.add(&mux_queue).map_err(|err| {
+                    format!("Failed to add mux queue to destination pipeline: {err:?}")
+                })?;
+                pipeline.add(&sink).map_err(|err| {
+                    format!("Failed to add rtmp2sink to destination pipeline: {err:?}")
+                })?;
+
+                sink.set_property("location", uri.clone());
+                if sink.has_property("tls-validation-flags") {
+                    sink.set_property_from_str("tls-validation-flags", "generic-error");
+                }
+                if mux.has_property("streamable") {
+                    mux.set_property("streamable", true);
+                }
+                if mux.has_property("latency") {
+                    mux.set_property("latency", 1_000_000_000u64);
+                }
+                gst::Element::link_many([&mux, &mux_queue, &sink].as_slice())
+                    .map_err(|err| format!("Failed to link rtmp mux chain: {err:?}"))?;
+
+                if let Some(appsrc) = video_appsrc.as_ref() {
+                    let vconv = Self::make_element("videoconvert", None)?;
+                    let timecodestamper = Self::make_element("timecodestamper", None)?;
+                    let timeoverlay = Self::make_element("timeoverlay", None)?;
+                    let venc = Self::select_video_encoder(&self.id)?;
+                    let vparse = Self::make_element("h264parse", None)?;
+                    let venc_queue = Self::make_element("queue", None)?;
+
+                    pipeline.add(&vconv).map_err(|err| {
+                        format!("Failed to add videoconvert to rtmp pipeline: {err:?}")
+                    })?;
+                    pipeline.add(&timecodestamper).map_err(|err| {
+                        format!("Failed to add timecodestamper to rtmp pipeline: {err:?}")
+                    })?;
+                    pipeline.add(&timeoverlay).map_err(|err| {
+                        format!("Failed to add timeoverlay to rtmp pipeline: {err:?}")
+                    })?;
+                    pipeline.add(&venc).map_err(|err| {
+                        format!("Failed to add video encoder to rtmp pipeline: {err:?}")
+                    })?;
+                    pipeline.add(&vparse).map_err(|err| {
+                        format!("Failed to add h264parse to rtmp pipeline: {err:?}")
+                    })?;
+                    pipeline.add(&venc_queue).map_err(|err| {
+                        format!("Failed to add video queue to rtmp pipeline: {err:?}")
+                    })?;
+
+                    if vparse.has_property("config-interval") {
+                        vparse.set_property("config-interval", -1i32);
+                    }
+                    if timecodestamper.has_property("source") {
+                        timecodestamper.set_property_from_str("source", "rtc");
+                    }
+                    if timeoverlay.has_property("time-mode") {
+                        timeoverlay.set_property_from_str("time-mode", "time-code");
+                    }
+
+                    gst::Element::link_many(
+                        [
+                            appsrc.upcast_ref::<gst::Element>(),
+                            &vconv,
+                            &timecodestamper,
+                            &timeoverlay,
+                            &venc,
+                            &vparse,
+                            &venc_queue,
+                            &mux,
+                        ]
+                        .as_slice(),
+                    )
+                    .map_err(|err| format!("Failed to link rtmp video chain: {err:?}"))?;
+                }
+
+                if let Some(appsrc) = audio_appsrc.as_ref() {
+                    let aconv = Self::make_element("audioconvert", None)?;
+                    let aresample = Self::make_element("audioresample", None)?;
+                    let aenc = Self::make_element("avenc_aac", None)?;
+                    let aenc_queue = Self::make_element("queue", None)?;
+
+                    pipeline.add(&aconv).map_err(|err| {
+                        format!("Failed to add audioconvert to rtmp pipeline: {err:?}")
+                    })?;
+                    pipeline.add(&aresample).map_err(|err| {
+                        format!("Failed to add audioresample to rtmp pipeline: {err:?}")
+                    })?;
+                    pipeline.add(&aenc).map_err(|err| {
+                        format!("Failed to add avenc_aac to rtmp pipeline: {err:?}")
+                    })?;
+                    pipeline.add(&aenc_queue).map_err(|err| {
+                        format!("Failed to add audio queue to rtmp pipeline: {err:?}")
+                    })?;
+
+                    gst::Element::link_many(
+                        [
+                            appsrc.upcast_ref::<gst::Element>(),
+                            &aconv,
+                            &aresample,
+                            &aenc,
+                            &aenc_queue,
+                            &mux,
+                        ]
+                        .as_slice(),
+                    )
+                    .map_err(|err| format!("Failed to link rtmp audio chain: {err:?}"))?;
+                }
+            }
+            DestinationFamily::Udp { host } => {
+                let mux = Self::make_element("mpegtsmux", None)?;
+                let sink = Self::make_element("udpsink", None)?;
+
+                pipeline.add(&mux).map_err(|err| {
+                    format!("Failed to add mpegtsmux to destination pipeline: {err:?}")
+                })?;
+                pipeline.add(&sink).map_err(|err| {
+                    format!("Failed to add udpsink to destination pipeline: {err:?}")
+                })?;
+
+                sink.set_property("host", host.clone());
+                sink.set_property("port", 5005i32);
+                if mux.has_property("alignment") {
+                    mux.set_property("alignment", 7i32);
+                }
+
+                if let Some(appsrc) = video_appsrc.as_ref() {
+                    let vconv = Self::make_element("videoconvert", None)?;
+                    let venc = Self::select_video_encoder(&self.id)?;
+                    let vparse = Self::make_element("h264parse", None)?;
+
+                    pipeline.add(&vconv).map_err(|err| {
+                        format!("Failed to add videoconvert to udp pipeline: {err:?}")
+                    })?;
+                    pipeline.add(&venc).map_err(|err| {
+                        format!("Failed to add video encoder to udp pipeline: {err:?}")
+                    })?;
+                    pipeline.add(&vparse).map_err(|err| {
+                        format!("Failed to add h264parse to udp pipeline: {err:?}")
+                    })?;
+
+                    gst::Element::link_many(
+                        [
+                            appsrc.upcast_ref::<gst::Element>(),
+                            &vconv,
+                            &venc,
+                            &vparse,
+                            &mux,
+                        ]
+                        .as_slice(),
+                    )
+                    .map_err(|err| format!("Failed to link udp video chain: {err:?}"))?;
+                }
+                if let Some(appsrc) = audio_appsrc.as_ref() {
+                    let aconv = Self::make_element("audioconvert", None)?;
+                    let aresample = Self::make_element("audioresample", None)?;
+                    let aenc = Self::make_element("avenc_aac", None)?;
+
+                    pipeline.add(&aconv).map_err(|err| {
+                        format!("Failed to add audioconvert to udp pipeline: {err:?}")
+                    })?;
+                    pipeline.add(&aresample).map_err(|err| {
+                        format!("Failed to add audioresample to udp pipeline: {err:?}")
+                    })?;
+                    pipeline.add(&aenc).map_err(|err| {
+                        format!("Failed to add avenc_aac to udp pipeline: {err:?}")
+                    })?;
+
+                    gst::Element::link_many(
+                        [
+                            appsrc.upcast_ref::<gst::Element>(),
+                            &aconv,
+                            &aresample,
+                            &aenc,
+                            &mux,
+                        ]
+                        .as_slice(),
+                    )
+                    .map_err(|err| format!("Failed to link udp audio chain: {err:?}"))?;
+                }
+
+                mux.link(&sink)
+                    .map_err(|err| format!("Failed to link mpegtsmux to udpsink: {err:?}"))?;
+            }
+            DestinationFamily::LocalFile {
+                base_name,
+                max_size_time,
+            } => {
+                let multiqueue = Self::make_element("multiqueue", None)?;
+                let sink = Self::make_element("splitmuxsink", None)?;
+
+                pipeline.add(&multiqueue).map_err(|err| {
+                    format!("Failed to add multiqueue to local-file pipeline: {err:?}")
+                })?;
+                pipeline.add(&sink).map_err(|err| {
+                    format!("Failed to add splitmuxsink to local-file pipeline: {err:?}")
+                })?;
+
+                match max_size_time {
+                    Some(max_size_time) => {
+                        let max_size_time_ns = (*max_size_time as u64) * 1_000_000;
+                        sink.set_property("max-size-time", max_size_time_ns);
+                        if sink.has_property("use-robust-muxing") {
+                            sink.set_property("use-robust-muxing", true);
+                        }
+                        sink.set_property("location", format!("{base_name}%05d.mp4"));
+                    }
+                    None => {
+                        sink.set_property("location", format!("{base_name}.mp4"));
+                    }
+                }
+
+                if let Some(appsrc) = video_appsrc.as_ref() {
+                    let vconv = Self::make_element("videoconvert", None)?;
+                    let venc = Self::select_video_encoder(&self.id)?;
+                    let vparse = Self::make_element("h264parse", None)?;
+
+                    pipeline.add(&vconv).map_err(|err| {
+                        format!("Failed to add videoconvert to local-file pipeline: {err:?}")
+                    })?;
+                    pipeline.add(&venc).map_err(|err| {
+                        format!("Failed to add video encoder to local-file pipeline: {err:?}")
+                    })?;
+                    pipeline.add(&vparse).map_err(|err| {
+                        format!("Failed to add h264parse to local-file pipeline: {err:?}")
+                    })?;
+
+                    gst::Element::link_many(
+                        [appsrc.upcast_ref::<gst::Element>(), &vconv, &venc, &vparse].as_slice(),
+                    )
+                    .map_err(|err| format!("Failed to link local-file video chain: {err:?}"))?;
+
+                    vparse
+                        .link_pads(None, &multiqueue, Some("sink_0"))
+                        .map_err(|err| {
+                            format!("Failed to link local-file video queue sink: {err:?}")
+                        })?;
+                    multiqueue
+                        .link_pads(Some("src_0"), &sink, Some("video"))
+                        .map_err(|err| {
+                            format!("Failed to link local-file video queue source: {err:?}")
+                        })?;
+                }
+
+                if let Some(appsrc) = audio_appsrc.as_ref() {
+                    let aconv = Self::make_element("audioconvert", None)?;
+                    let aresample = Self::make_element("audioresample", None)?;
+                    let aenc = Self::make_element("avenc_aac", None)?;
+
+                    pipeline.add(&aconv).map_err(|err| {
+                        format!("Failed to add audioconvert to local-file pipeline: {err:?}")
+                    })?;
+                    pipeline.add(&aresample).map_err(|err| {
+                        format!("Failed to add audioresample to local-file pipeline: {err:?}")
+                    })?;
+                    pipeline.add(&aenc).map_err(|err| {
+                        format!("Failed to add avenc_aac to local-file pipeline: {err:?}")
+                    })?;
+
+                    gst::Element::link_many(
+                        [
+                            appsrc.upcast_ref::<gst::Element>(),
+                            &aconv,
+                            &aresample,
+                            &aenc,
+                        ]
+                        .as_slice(),
+                    )
+                    .map_err(|err| format!("Failed to link local-file audio chain: {err:?}"))?;
+
+                    aenc.link_pads(None, &multiqueue, Some("sink_1"))
+                        .map_err(|err| {
+                            format!("Failed to link local-file audio queue sink: {err:?}")
+                        })?;
+                    multiqueue
+                        .link_pads(Some("src_1"), &sink, Some("audio_0"))
+                        .map_err(|err| {
+                            format!("Failed to link local-file audio queue source: {err:?}")
+                        })?;
+                }
+            }
+            DestinationFamily::LocalPlayback => {
+                if let Some(appsrc) = video_appsrc.as_ref() {
+                    let vqueue = Self::make_element("queue", None)?;
+                    let vconv = Self::make_element("videoconvert", None)?;
+                    let vsink = Self::make_element("autovideosink", None)?;
+
+                    pipeline.add(&vqueue).map_err(|err| {
+                        format!("Failed to add video queue to local-playback pipeline: {err:?}")
+                    })?;
+                    pipeline.add(&vconv).map_err(|err| {
+                        format!("Failed to add videoconvert to local-playback pipeline: {err:?}")
+                    })?;
+                    pipeline.add(&vsink).map_err(|err| {
+                        format!("Failed to add autovideosink to local-playback pipeline: {err:?}")
+                    })?;
+
+                    gst::Element::link_many(
+                        [appsrc.upcast_ref::<gst::Element>(), &vqueue, &vconv, &vsink].as_slice(),
+                    )
+                    .map_err(|err| format!("Failed to link local-playback video chain: {err:?}"))?;
+                }
+
+                if let Some(appsrc) = audio_appsrc.as_ref() {
+                    let aqueue = Self::make_element("queue", None)?;
+                    let aconv = Self::make_element("audioconvert", None)?;
+                    let aresample = Self::make_element("audioresample", None)?;
+                    let asink = Self::make_element("autoaudiosink", None)?;
+
+                    pipeline.add(&aqueue).map_err(|err| {
+                        format!("Failed to add audio queue to local-playback pipeline: {err:?}")
+                    })?;
+                    pipeline.add(&aconv).map_err(|err| {
+                        format!("Failed to add audioconvert to local-playback pipeline: {err:?}")
+                    })?;
+                    pipeline.add(&aresample).map_err(|err| {
+                        format!("Failed to add audioresample to local-playback pipeline: {err:?}")
+                    })?;
+                    pipeline.add(&asink).map_err(|err| {
+                        format!("Failed to add autoaudiosink to local-playback pipeline: {err:?}")
+                    })?;
+
+                    gst::Element::link_many(
+                        [
+                            appsrc.upcast_ref::<gst::Element>(),
+                            &aqueue,
+                            &aconv,
+                            &aresample,
+                            &asink,
+                        ]
+                        .as_slice(),
+                    )
+                    .map_err(|err| format!("Failed to link local-playback audio chain: {err:?}"))?;
+                }
+            }
+        }
+
+        Ok(LiveDestinationPipeline {
+            pipeline,
+            video_appsrc,
+            audio_appsrc,
+        })
+    }
+
+    fn teardown_live_pipeline(&mut self) {
+        if let Some(live) = self.live_pipeline.take() {
+            let _ = live.pipeline.set_state(gst::State::Null);
+        }
+    }
+
+    fn ensure_live_pipeline(&mut self) -> Result<(), String> {
+        if self.live_pipeline.is_some() {
+            return Ok(());
+        }
+        let Some(profile) = self.pipeline.as_ref() else {
+            return Err(format!(
+                "Destination {} has no active pipeline profile to realize",
+                self.id
+            ));
+        };
+
+        self.live_pipeline = Some(self.build_live_pipeline(profile)?);
+        Ok(())
+    }
+
+    fn sync_live_pipeline(&mut self) -> Result<(), String> {
+        if !Self::gst_initialized() {
+            return Ok(());
+        }
+
+        let stage = self
+            .pipeline
+            .as_ref()
+            .map(|profile| profile.stage)
+            .unwrap_or(DestinationPipelineStage::Idle);
+
+        match stage {
+            DestinationPipelineStage::Idle => {
+                self.teardown_live_pipeline();
+                Ok(())
+            }
+            DestinationPipelineStage::Scheduled | DestinationPipelineStage::Playing => {
+                self.ensure_live_pipeline()?;
+                let target_state = if stage == DestinationPipelineStage::Scheduled {
+                    gst::State::Paused
+                } else {
+                    gst::State::Playing
+                };
+
+                if let Some(live) = self.live_pipeline.as_ref() {
+                    live.pipeline.set_state(target_state).map_err(|err| {
+                        format!(
+                            "Failed to set destination pipeline state to {target_state:?}: {err:?}"
+                        )
+                    })?;
+                }
+
+                Ok(())
+            }
         }
     }
 
@@ -156,6 +655,18 @@ impl DestinationNode {
         }
     }
 
+    pub fn live_audio_appsrc(&self) -> Option<AppSrc> {
+        self.live_pipeline
+            .as_ref()
+            .and_then(|live| live.audio_appsrc.clone())
+    }
+
+    pub fn live_video_appsrc(&self) -> Option<AppSrc> {
+        self.live_pipeline
+            .as_ref()
+            .and_then(|live| live.video_appsrc.clone())
+    }
+
     fn ensure_start_ready(&self) -> Result<(), String> {
         if self.audio_enabled && self.audio_slot_id.is_none() {
             return Err(format!(
@@ -188,22 +699,39 @@ impl DestinationNode {
         let now = Utc::now();
         if cue_time.is_some_and(|cue| cue > now) {
             self.state = State::Starting;
-            let mut pipeline =
-                DestinationPipelineProfile::from_family(&self.family, self.audio_enabled, self.video_enabled);
+            let mut pipeline = DestinationPipelineProfile::from_family(
+                &self.family,
+                self.audio_enabled,
+                self.video_enabled,
+            );
             pipeline.stage = DestinationPipelineStage::Scheduled;
             self.pipeline = Some(pipeline);
         } else {
             self.state = State::Started;
-            let mut pipeline =
-                DestinationPipelineProfile::from_family(&self.family, self.audio_enabled, self.video_enabled);
+            let mut pipeline = DestinationPipelineProfile::from_family(
+                &self.family,
+                self.audio_enabled,
+                self.video_enabled,
+            );
             pipeline.stage = DestinationPipelineStage::Playing;
             self.pipeline = Some(pipeline);
+        }
+
+        if let Err(err) = self.sync_live_pipeline() {
+            self.last_error = Some(err.clone());
+            self.state = State::Stopped;
+            if let Some(profile) = self.pipeline.as_mut() {
+                profile.stage = DestinationPipelineStage::Idle;
+            }
+            self.teardown_live_pipeline();
+            return Err(err);
         }
 
         Ok(())
     }
 
     pub fn stop(&mut self) {
+        self.teardown_live_pipeline();
         self.state = State::Stopped;
         if let Some(pipeline) = self.pipeline.as_mut() {
             pipeline.stage = DestinationPipelineStage::Idle;
@@ -223,5 +751,30 @@ impl DestinationNode {
             end_time: self.end_time,
             state: self.state,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schedule_without_gstreamer_init_keeps_state_machine_behavior() {
+        let mut node = DestinationNode::new(
+            "destination-test".to_string(),
+            DestinationFamily::LocalPlayback,
+            false,
+            true,
+        );
+
+        node.connect_input("link-video", false, true).unwrap();
+        assert!(node.schedule(None, None).is_ok());
+        assert_eq!(node.state, State::Started);
+        assert!(node.live_pipeline.is_none());
+
+        let cue = Utc::now() + chrono::Duration::seconds(15);
+        assert!(node.schedule(Some(cue), None).is_ok());
+        assert_eq!(node.state, State::Starting);
+        assert!(node.live_pipeline.is_none());
     }
 }

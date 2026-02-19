@@ -1,6 +1,7 @@
 use crate::migration::protocol::{NodeInfo, SourceInfo, State};
 use chrono::{DateTime, Duration, Utc};
 use gst::prelude::*;
+use gst_app::AppSink;
 use std::collections::BTreeSet;
 
 const PREROLL_LEAD_TIME_SECONDS: i64 = 10;
@@ -24,6 +25,7 @@ pub struct VideoGeneratorPipelineProfile {
 #[derive(Debug, Clone)]
 pub struct LiveVideoGeneratorPipeline {
     pub pipeline: gst::Pipeline,
+    pub appsink: AppSink,
 }
 
 impl VideoGeneratorPipelineProfile {
@@ -85,7 +87,10 @@ impl VideoGeneratorNode {
             .map_err(|err| format!("Failed to create element `{element}`: {}", &*err.message))
     }
 
-    fn build_live_pipeline(id: &str, profile: &VideoGeneratorPipelineProfile) -> Result<LiveVideoGeneratorPipeline, String> {
+    fn build_live_pipeline(
+        id: &str,
+        profile: &VideoGeneratorPipelineProfile,
+    ) -> Result<LiveVideoGeneratorPipeline, String> {
         let pipeline = gst::Pipeline::with_name(&format!("migration-videogen-{id}"));
 
         let src = Self::make_element("videotestsrc", &format!("videogen-src-{id}"))?;
@@ -94,25 +99,27 @@ impl VideoGeneratorNode {
         src.set_property_from_str("pattern", &profile.pattern);
 
         let deinterlace = Self::make_element("deinterlace", &format!("videogen-deinterlace-{id}"))?;
-        let appsink = Self::make_element("appsink", &format!("videogen-appsink-{id}"))?;
+        let appsink = Self::make_element("appsink", &format!("videogen-appsink-{id}"))?
+            .downcast::<AppSink>()
+            .map_err(|_| format!("Failed to downcast video generator appsink for `{id}`"))?;
 
+        pipeline.add(&src).map_err(|err| {
+            format!("Failed to add videotestsrc to video generator pipeline: {err:?}")
+        })?;
+        pipeline.add(&deinterlace).map_err(|err| {
+            format!("Failed to add deinterlace to video generator pipeline: {err:?}")
+        })?;
         pipeline
-            .add(&src)
-            .map_err(|err| format!("Failed to add videotestsrc to video generator pipeline: {err:?}"))?;
-        pipeline
-            .add(&deinterlace)
-            .map_err(|err| format!("Failed to add deinterlace to video generator pipeline: {err:?}"))?;
-        pipeline
-            .add(&appsink)
+            .add(appsink.upcast_ref::<gst::Element>())
             .map_err(|err| format!("Failed to add appsink to video generator pipeline: {err:?}"))?;
 
         src.link(&deinterlace)
             .map_err(|err| format!("Failed to link videotestsrc->deinterlace: {err:?}"))?;
         deinterlace
-            .link(&appsink)
+            .link(appsink.upcast_ref::<gst::Element>())
             .map_err(|err| format!("Failed to link deinterlace->appsink: {err:?}"))?;
 
-        Ok(LiveVideoGeneratorPipeline { pipeline })
+        Ok(LiveVideoGeneratorPipeline { pipeline, appsink })
     }
 
     fn teardown_live_pipeline(&mut self) {
@@ -172,6 +179,10 @@ impl VideoGeneratorNode {
     pub fn remove_consumer_link(&mut self, link_id: &str) {
         self.audio_consumer_slot_ids.remove(link_id);
         self.video_consumer_slot_ids.remove(link_id);
+    }
+
+    pub fn live_video_appsink(&self) -> Option<AppSink> {
+        self.live_pipeline.as_ref().map(|live| live.appsink.clone())
     }
 
     pub fn schedule(

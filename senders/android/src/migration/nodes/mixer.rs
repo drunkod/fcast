@@ -1,6 +1,8 @@
 use crate::migration::nodes::control::evaluate_control_points;
 use crate::migration::protocol::{ControlPoint, MixerInfo, MixerSlotInfo, NodeInfo, State};
 use chrono::{DateTime, Duration, Utc};
+use gst::prelude::*;
+use gst_app::{AppSink, AppSrc};
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
 
@@ -25,6 +27,26 @@ pub struct MixerPipelineProfile {
     pub stage: MixerPipelineStage,
 }
 
+#[derive(Debug, Clone)]
+pub struct LiveMixerSlot {
+    pub video_appsrc: Option<AppSrc>,
+    pub video_pad: Option<gst::Pad>,
+    pub audio_appsrc: Option<AppSrc>,
+    pub audio_pad: Option<gst::Pad>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveMixerPipeline {
+    pub pipeline: gst::Pipeline,
+    pub video_mixer: Option<gst::Element>,
+    pub audio_mixer: Option<gst::Element>,
+    pub video_capsfilter: Option<gst::Element>,
+    pub audio_capsfilter: Option<gst::Element>,
+    pub video_output_appsink: Option<AppSink>,
+    pub audio_output_appsink: Option<AppSink>,
+    pub slots: HashMap<String, LiveMixerSlot>,
+}
+
 impl MixerPipelineProfile {
     fn from_settings(
         settings: &HashMap<String, Value>,
@@ -35,17 +57,32 @@ impl MixerPipelineProfile {
         let width = settings
             .get("width")
             .and_then(Value::as_i64)
-            .or_else(|| settings.get("width").and_then(Value::as_f64).map(|v| v as i64))
+            .or_else(|| {
+                settings
+                    .get("width")
+                    .and_then(Value::as_f64)
+                    .map(|v| v as i64)
+            })
             .unwrap_or(1920);
         let height = settings
             .get("height")
             .and_then(Value::as_i64)
-            .or_else(|| settings.get("height").and_then(Value::as_f64).map(|v| v as i64))
+            .or_else(|| {
+                settings
+                    .get("height")
+                    .and_then(Value::as_f64)
+                    .map(|v| v as i64)
+            })
             .unwrap_or(1080);
         let sample_rate = settings
             .get("sample-rate")
             .and_then(Value::as_i64)
-            .or_else(|| settings.get("sample-rate").and_then(Value::as_f64).map(|v| v as i64))
+            .or_else(|| {
+                settings
+                    .get("sample-rate")
+                    .and_then(Value::as_f64)
+                    .map(|v| v as i64)
+            })
             .unwrap_or(48000);
         let fallback_timeout_ms = settings
             .get("fallback-timeout")
@@ -174,10 +211,470 @@ pub struct MixerNode {
     pub slot_settings: HashMap<String, HashMap<String, Value>>,
     pub slot_control_points: HashMap<String, HashMap<String, Vec<ControlPoint>>>,
     pub pipeline: MixerPipelineProfile,
+    pub live_pipeline: Option<LiveMixerPipeline>,
     pub last_error: Option<String>,
 }
 
 impl MixerNode {
+    fn gst_initialized() -> bool {
+        unsafe { gst::ffi::gst_is_initialized() != 0 }
+    }
+
+    fn make_element(element: &str, name: Option<&str>) -> Result<gst::Element, String> {
+        let factory = gst::ElementFactory::make(element);
+        let builder = match name {
+            Some(name) => factory.name(name),
+            None => factory,
+        };
+        builder
+            .build()
+            .map_err(|err| format!("Failed to create element `{element}`: {}", &*err.message))
+    }
+
+    fn make_appsrc(id: &str, slot_id: &str, media: &str) -> Result<AppSrc, String> {
+        let element = Self::make_element(
+            "appsrc",
+            Some(&format!("mixer-{media}-appsrc-{id}-{slot_id}")),
+        )?;
+        let appsrc = element
+            .downcast::<AppSrc>()
+            .map_err(|_| format!("Failed to downcast appsrc for mixer `{id}` slot `{slot_id}`"))?;
+        appsrc.set_property("is-live", true);
+        appsrc.set_property("do-timestamp", true);
+        appsrc.set_property_from_str("format", "time");
+        appsrc.set_property("block", false);
+        Ok(appsrc)
+    }
+
+    fn parse_i32(value: Option<&Value>) -> Option<i32> {
+        value
+            .and_then(Value::as_i64)
+            .or_else(|| value.and_then(Value::as_f64).map(|v| v as i64))
+            .map(|v| v as i32)
+    }
+
+    fn parse_f64(value: Option<&Value>) -> Option<f64> {
+        value
+            .and_then(Value::as_f64)
+            .or_else(|| value.and_then(Value::as_i64).map(|v| v as f64))
+    }
+
+    fn slot_has_media(slot: &HashMap<String, Value>, media: &str) -> bool {
+        slot.keys()
+            .any(|key| key.starts_with(&format!("{media}::")))
+    }
+
+    fn current_width(&self) -> i32 {
+        Self::parse_i32(self.settings.get("width")).unwrap_or(1920)
+    }
+
+    fn current_height(&self) -> i32 {
+        Self::parse_i32(self.settings.get("height")).unwrap_or(1080)
+    }
+
+    fn current_sample_rate(&self) -> i32 {
+        Self::parse_i32(self.settings.get("sample-rate")).unwrap_or(48000)
+    }
+
+    fn set_video_caps(capsfilter: &gst::Element, width: i32, height: i32) {
+        let caps = gst::Caps::builder("video/x-raw")
+            .field("width", &width)
+            .field("height", &height)
+            .field("framerate", &gst::Fraction::new(30, 1))
+            .build();
+        if capsfilter.has_property("caps") {
+            capsfilter.set_property("caps", &caps);
+        }
+    }
+
+    fn set_audio_caps(capsfilter: &gst::Element, sample_rate: i32) {
+        let caps = gst::Caps::builder("audio/x-raw")
+            .field("channels", &2i32)
+            .field("rate", &sample_rate)
+            .build();
+        if capsfilter.has_property("caps") {
+            capsfilter.set_property("caps", &caps);
+        }
+    }
+
+    fn apply_video_slot_properties(pad: &gst::Pad, slot_settings: &HashMap<String, Value>) {
+        for (key, value) in slot_settings {
+            if !key.starts_with("video::") {
+                continue;
+            }
+            let prop = key.trim_start_matches("video::");
+            match prop {
+                "x" | "y" | "width" | "height" | "zorder" => {
+                    if let Some(v) = Self::parse_i32(Some(value)) {
+                        if pad.has_property(prop) {
+                            pad.set_property(prop, v);
+                        }
+                    }
+                }
+                "alpha" => {
+                    if let Some(v) = Self::parse_f64(Some(value)) {
+                        if pad.has_property("alpha") {
+                            pad.set_property("alpha", v);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn apply_audio_slot_properties(pad: &gst::Pad, slot_settings: &HashMap<String, Value>) {
+        if let Some(v) = Self::parse_f64(slot_settings.get("audio::volume")) {
+            if pad.has_property("volume") {
+                pad.set_property("volume", v);
+            }
+        }
+    }
+
+    fn build_live_pipeline(&self) -> Result<LiveMixerPipeline, String> {
+        let pipeline = gst::Pipeline::with_name(&format!("migration-mixer-{}", self.id));
+
+        let mut live = LiveMixerPipeline {
+            pipeline: pipeline.clone(),
+            video_mixer: None,
+            audio_mixer: None,
+            video_capsfilter: None,
+            audio_capsfilter: None,
+            video_output_appsink: None,
+            audio_output_appsink: None,
+            slots: HashMap::new(),
+        };
+
+        if self.video_enabled {
+            let mixer = Self::make_element("compositor", Some("compositor"))?;
+            let capsfilter = Self::make_element("capsfilter", Some("mixer-video-capsfilter"))?;
+            let sink = Self::make_element("appsink", Some("mixer-video-appsink"))?
+                .downcast::<AppSink>()
+                .map_err(|_| "Failed to downcast mixer video appsink".to_string())?;
+            let base_src = Self::make_element("videotestsrc", Some("mixer-video-base-src"))?;
+            let base_queue = Self::make_element("queue", Some("mixer-video-base-queue"))?;
+
+            base_src.set_property("is-live", true);
+            base_src.set_property_from_str("pattern", "black");
+            if mixer.has_property("background") {
+                mixer.set_property_from_str("background", "black");
+            }
+
+            pipeline
+                .add(&mixer)
+                .map_err(|err| format!("Failed to add compositor to mixer pipeline: {err:?}"))?;
+            pipeline.add(&capsfilter).map_err(|err| {
+                format!("Failed to add video capsfilter to mixer pipeline: {err:?}")
+            })?;
+            pipeline
+                .add(sink.upcast_ref::<gst::Element>())
+                .map_err(|err| format!("Failed to add video appsink to mixer pipeline: {err:?}"))?;
+            pipeline.add(&base_src).map_err(|err| {
+                format!("Failed to add video base source to mixer pipeline: {err:?}")
+            })?;
+            pipeline.add(&base_queue).map_err(|err| {
+                format!("Failed to add video base queue to mixer pipeline: {err:?}")
+            })?;
+
+            Self::set_video_caps(&capsfilter, self.current_width(), self.current_height());
+
+            base_src
+                .link(&base_queue)
+                .map_err(|err| format!("Failed to link video base source to queue: {err:?}"))?;
+            let base_pad = mixer
+                .request_pad_simple("sink_%u")
+                .ok_or_else(|| "Failed to request base video pad on compositor".to_string())?;
+            base_queue
+                .static_pad("src")
+                .ok_or_else(|| "Video base queue is missing src pad".to_string())?
+                .link(&base_pad)
+                .map_err(|err| format!("Failed to link video base queue to compositor: {err:?}"))?;
+
+            gst::Element::link_many(
+                [&mixer, &capsfilter, sink.upcast_ref::<gst::Element>()].as_slice(),
+            )
+            .map_err(|err| format!("Failed to link mixer video output chain: {err:?}"))?;
+
+            live.video_mixer = Some(mixer);
+            live.video_capsfilter = Some(capsfilter);
+            live.video_output_appsink = Some(sink);
+        }
+
+        if self.audio_enabled {
+            let mixer = Self::make_element("audiomixer", Some("audiomixer"))?;
+            let aconv = Self::make_element("audioconvert", Some("mixer-audio-convert"))?;
+            let aresample = Self::make_element("audioresample", Some("mixer-audio-resample"))?;
+            let capsfilter = Self::make_element("capsfilter", Some("mixer-audio-capsfilter"))?;
+            let sink = Self::make_element("appsink", Some("mixer-audio-appsink"))?
+                .downcast::<AppSink>()
+                .map_err(|_| "Failed to downcast mixer audio appsink".to_string())?;
+            let base_src = Self::make_element("audiotestsrc", Some("mixer-audio-base-src"))?;
+            let base_queue = Self::make_element("queue", Some("mixer-audio-base-queue"))?;
+
+            base_src.set_property("is-live", true);
+            base_src.set_property("volume", 0.0f64);
+
+            pipeline
+                .add(&mixer)
+                .map_err(|err| format!("Failed to add audiomixer to mixer pipeline: {err:?}"))?;
+            pipeline
+                .add(&aconv)
+                .map_err(|err| format!("Failed to add audio convert to mixer pipeline: {err:?}"))?;
+            pipeline.add(&aresample).map_err(|err| {
+                format!("Failed to add audio resample to mixer pipeline: {err:?}")
+            })?;
+            pipeline.add(&capsfilter).map_err(|err| {
+                format!("Failed to add audio capsfilter to mixer pipeline: {err:?}")
+            })?;
+            pipeline
+                .add(sink.upcast_ref::<gst::Element>())
+                .map_err(|err| format!("Failed to add audio appsink to mixer pipeline: {err:?}"))?;
+            pipeline.add(&base_src).map_err(|err| {
+                format!("Failed to add audio base source to mixer pipeline: {err:?}")
+            })?;
+            pipeline.add(&base_queue).map_err(|err| {
+                format!("Failed to add audio base queue to mixer pipeline: {err:?}")
+            })?;
+
+            Self::set_audio_caps(&capsfilter, self.current_sample_rate());
+
+            base_src
+                .link(&base_queue)
+                .map_err(|err| format!("Failed to link audio base source to queue: {err:?}"))?;
+            let base_pad = mixer
+                .request_pad_simple("sink_%u")
+                .ok_or_else(|| "Failed to request base audio pad on audiomixer".to_string())?;
+            if base_pad.has_property("volume") {
+                base_pad.set_property("volume", 0.0f64);
+            }
+            base_queue
+                .static_pad("src")
+                .ok_or_else(|| "Audio base queue is missing src pad".to_string())?
+                .link(&base_pad)
+                .map_err(|err| format!("Failed to link audio base queue to audiomixer: {err:?}"))?;
+
+            gst::Element::link_many(
+                [
+                    &mixer,
+                    &aconv,
+                    &aresample,
+                    &capsfilter,
+                    sink.upcast_ref::<gst::Element>(),
+                ]
+                .as_slice(),
+            )
+            .map_err(|err| format!("Failed to link mixer audio output chain: {err:?}"))?;
+
+            live.audio_mixer = Some(mixer);
+            live.audio_capsfilter = Some(capsfilter);
+            live.audio_output_appsink = Some(sink);
+        }
+
+        for (slot_id, slot_settings) in &self.slot_settings {
+            let has_video = self.video_enabled && Self::slot_has_media(slot_settings, "video");
+            let has_audio = self.audio_enabled && Self::slot_has_media(slot_settings, "audio");
+
+            if !has_video && !has_audio {
+                continue;
+            }
+
+            let mut live_slot = LiveMixerSlot {
+                video_appsrc: None,
+                video_pad: None,
+                audio_appsrc: None,
+                audio_pad: None,
+            };
+
+            if has_video {
+                let appsrc = Self::make_appsrc(&self.id, slot_id, "video")?;
+                let queue = Self::make_element(
+                    "queue",
+                    Some(&format!("mixer-slot-video-queue-{slot_id}")),
+                )?;
+                pipeline
+                    .add(appsrc.upcast_ref::<gst::Element>())
+                    .map_err(|err| {
+                        format!("Failed to add video slot appsrc `{slot_id}`: {err:?}")
+                    })?;
+                pipeline.add(&queue).map_err(|err| {
+                    format!("Failed to add video slot queue `{slot_id}`: {err:?}")
+                })?;
+                appsrc
+                    .upcast_ref::<gst::Element>()
+                    .link(&queue)
+                    .map_err(|err| {
+                        format!("Failed to link video slot appsrc `{slot_id}`: {err:?}")
+                    })?;
+
+                if let Some(video_mixer) = live.video_mixer.as_ref() {
+                    let pad = video_mixer.request_pad_simple("sink_%u").ok_or_else(|| {
+                        format!("Failed to request video mixer pad for slot `{slot_id}`")
+                    })?;
+                    queue
+                        .static_pad("src")
+                        .ok_or_else(|| format!("Video queue for slot `{slot_id}` has no src pad"))?
+                        .link(&pad)
+                        .map_err(|err| {
+                            format!("Failed to link video slot `{slot_id}` to mixer: {err:?}")
+                        })?;
+                    Self::apply_video_slot_properties(&pad, slot_settings);
+                    live_slot.video_pad = Some(pad);
+                }
+                live_slot.video_appsrc = Some(appsrc);
+            }
+
+            if has_audio {
+                let appsrc = Self::make_appsrc(&self.id, slot_id, "audio")?;
+                let queue = Self::make_element(
+                    "queue",
+                    Some(&format!("mixer-slot-audio-queue-{slot_id}")),
+                )?;
+                let aconv = Self::make_element(
+                    "audioconvert",
+                    Some(&format!("mixer-slot-audio-conv-{slot_id}")),
+                )?;
+                let aresample = Self::make_element(
+                    "audioresample",
+                    Some(&format!("mixer-slot-audio-resample-{slot_id}")),
+                )?;
+                let capsfilter = Self::make_element(
+                    "capsfilter",
+                    Some(&format!("mixer-slot-audio-caps-{slot_id}")),
+                )?;
+                Self::set_audio_caps(&capsfilter, self.current_sample_rate());
+
+                pipeline
+                    .add(appsrc.upcast_ref::<gst::Element>())
+                    .map_err(|err| {
+                        format!("Failed to add audio slot appsrc `{slot_id}`: {err:?}")
+                    })?;
+                pipeline.add(&queue).map_err(|err| {
+                    format!("Failed to add audio slot queue `{slot_id}`: {err:?}")
+                })?;
+                pipeline.add(&aconv).map_err(|err| {
+                    format!("Failed to add audio slot convert `{slot_id}`: {err:?}")
+                })?;
+                pipeline.add(&aresample).map_err(|err| {
+                    format!("Failed to add audio slot resample `{slot_id}`: {err:?}")
+                })?;
+                pipeline.add(&capsfilter).map_err(|err| {
+                    format!("Failed to add audio slot capsfilter `{slot_id}`: {err:?}")
+                })?;
+
+                gst::Element::link_many(
+                    [
+                        appsrc.upcast_ref::<gst::Element>(),
+                        &aconv,
+                        &aresample,
+                        &capsfilter,
+                        &queue,
+                    ]
+                    .as_slice(),
+                )
+                .map_err(|err| {
+                    format!("Failed to link audio slot `{slot_id}` processing chain: {err:?}")
+                })?;
+
+                if let Some(audio_mixer) = live.audio_mixer.as_ref() {
+                    let pad = audio_mixer.request_pad_simple("sink_%u").ok_or_else(|| {
+                        format!("Failed to request audio mixer pad for slot `{slot_id}`")
+                    })?;
+                    queue
+                        .static_pad("src")
+                        .ok_or_else(|| format!("Audio queue for slot `{slot_id}` has no src pad"))?
+                        .link(&pad)
+                        .map_err(|err| {
+                            format!("Failed to link audio slot `{slot_id}` to mixer: {err:?}")
+                        })?;
+                    Self::apply_audio_slot_properties(&pad, slot_settings);
+                    live_slot.audio_pad = Some(pad);
+                }
+                live_slot.audio_appsrc = Some(appsrc);
+            }
+
+            live.slots.insert(slot_id.clone(), live_slot);
+        }
+
+        Ok(live)
+    }
+
+    fn apply_live_settings(&mut self) {
+        let width = self.current_width();
+        let height = self.current_height();
+        let sample_rate = self.current_sample_rate();
+
+        if let Some(live) = self.live_pipeline.as_mut() {
+            if let Some(video_caps) = live.video_capsfilter.as_ref() {
+                Self::set_video_caps(video_caps, width, height);
+            }
+            if let Some(audio_caps) = live.audio_capsfilter.as_ref() {
+                Self::set_audio_caps(audio_caps, sample_rate);
+            }
+
+            for (slot_id, live_slot) in &mut live.slots {
+                if let Some(slot_settings) = self.slot_settings.get(slot_id) {
+                    if let Some(pad) = live_slot.video_pad.as_ref() {
+                        Self::apply_video_slot_properties(pad, slot_settings);
+                    }
+                    if let Some(pad) = live_slot.audio_pad.as_ref() {
+                        Self::apply_audio_slot_properties(pad, slot_settings);
+                    }
+                }
+            }
+        }
+    }
+
+    fn teardown_live_pipeline(&mut self) {
+        if let Some(live) = self.live_pipeline.take() {
+            let _ = live.pipeline.set_state(gst::State::Null);
+        }
+    }
+
+    fn live_slots_match_model(&self) -> bool {
+        let Some(live) = self.live_pipeline.as_ref() else {
+            return false;
+        };
+        live.slots.len() == self.slot_settings.len()
+            && self
+                .slot_settings
+                .keys()
+                .all(|slot_id| live.slots.contains_key(slot_id))
+    }
+
+    fn sync_live_pipeline(&mut self) -> Result<(), String> {
+        if !Self::gst_initialized() {
+            return Ok(());
+        }
+
+        match self.pipeline.stage {
+            MixerPipelineStage::Idle => {
+                self.teardown_live_pipeline();
+                Ok(())
+            }
+            MixerPipelineStage::Starting | MixerPipelineStage::Playing => {
+                if self.live_pipeline.is_none() || !self.live_slots_match_model() {
+                    self.teardown_live_pipeline();
+                    self.live_pipeline = Some(self.build_live_pipeline()?);
+                }
+
+                self.apply_live_settings();
+
+                let target_state = if self.pipeline.stage == MixerPipelineStage::Starting {
+                    gst::State::Paused
+                } else {
+                    gst::State::Playing
+                };
+
+                if let Some(live) = self.live_pipeline.as_ref() {
+                    live.pipeline.set_state(target_state).map_err(|err| {
+                        format!("Failed to set mixer pipeline state to {target_state:?}: {err:?}")
+                    })?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     pub fn new(
         id: String,
         config: Option<HashMap<String, Value>>,
@@ -199,8 +696,12 @@ impl MixerNode {
             }
         }
 
-        let pipeline =
-            MixerPipelineProfile::from_settings(&settings, audio_enabled, video_enabled, MixerPipelineStage::Idle);
+        let pipeline = MixerPipelineProfile::from_settings(
+            &settings,
+            audio_enabled,
+            video_enabled,
+            MixerPipelineStage::Idle,
+        );
 
         Ok(Self {
             id,
@@ -217,6 +718,7 @@ impl MixerNode {
             slot_settings: HashMap::new(),
             slot_control_points: HashMap::new(),
             pipeline,
+            live_pipeline: None,
             last_error: None,
         })
     }
@@ -228,13 +730,23 @@ impl MixerNode {
                 .settings
                 .get("width")
                 .and_then(Value::as_i64)
-                .or_else(|| self.settings.get("width").and_then(Value::as_f64).map(|v| v as i64))
+                .or_else(|| {
+                    self.settings
+                        .get("width")
+                        .and_then(Value::as_f64)
+                        .map(|v| v as i64)
+                })
                 .unwrap_or(1920);
             let height = self
                 .settings
                 .get("height")
                 .and_then(Value::as_i64)
-                .or_else(|| self.settings.get("height").and_then(Value::as_f64).map(|v| v as i64))
+                .or_else(|| {
+                    self.settings
+                        .get("height")
+                        .and_then(Value::as_f64)
+                        .map(|v| v as i64)
+                })
                 .unwrap_or(1080);
 
             defaults.insert("video::x".to_string(), Value::from(0));
@@ -262,6 +774,32 @@ impl MixerNode {
     pub fn disconnect_output_consumer(&mut self, link_id: &str) {
         self.audio_consumer_slot_ids.remove(link_id);
         self.video_consumer_slot_ids.remove(link_id);
+    }
+
+    pub fn live_audio_output_appsink(&self) -> Option<AppSink> {
+        self.live_pipeline
+            .as_ref()
+            .and_then(|live| live.audio_output_appsink.clone())
+    }
+
+    pub fn live_video_output_appsink(&self) -> Option<AppSink> {
+        self.live_pipeline
+            .as_ref()
+            .and_then(|live| live.video_output_appsink.clone())
+    }
+
+    pub fn live_slot_audio_appsrc(&self, slot_id: &str) -> Option<AppSrc> {
+        self.live_pipeline
+            .as_ref()
+            .and_then(|live| live.slots.get(slot_id))
+            .and_then(|slot| slot.audio_appsrc.clone())
+    }
+
+    pub fn live_slot_video_appsrc(&self, slot_id: &str) -> Option<AppSrc> {
+        self.live_pipeline
+            .as_ref()
+            .and_then(|live| live.slots.get(slot_id))
+            .and_then(|slot| slot.video_appsrc.clone())
     }
 
     pub fn connect_input_slot(
@@ -309,6 +847,7 @@ impl MixerNode {
         self.slot_control_points
             .entry(link_id.to_string())
             .or_default();
+        self.sync_live_pipeline()?;
         Ok(())
     }
 
@@ -316,17 +855,24 @@ impl MixerNode {
         self.slots.remove(link_id);
         self.slot_settings.remove(link_id);
         self.slot_control_points.remove(link_id);
+        if let Err(err) = self.sync_live_pipeline() {
+            self.last_error = Some(err);
+        }
     }
 
     pub fn add_control_point(&mut self, property: &str, cp: ControlPoint) -> Result<(), String> {
         if !self.settings.contains_key(property) {
-            return Err(format!("Mixer {} has no setting with name {property}", self.id));
+            return Err(format!(
+                "Mixer {} has no setting with name {property}",
+                self.id
+            ));
         }
         validate_setting_value(property, &cp.value)?;
         let points = self.control_points.entry(property.to_string()).or_default();
         points.push(cp);
         points.sort();
         self.apply_control_points(Utc::now());
+        self.sync_live_pipeline()?;
         Ok(())
     }
 
@@ -335,6 +881,9 @@ impl MixerNode {
             points.retain(|point| point.id != controller_id);
         }
         self.apply_control_points(Utc::now());
+        if let Err(err) = self.sync_live_pipeline() {
+            self.last_error = Some(err);
+        }
     }
 
     pub fn add_slot_control_point(
@@ -357,6 +906,7 @@ impl MixerNode {
         points.push(cp);
         points.sort();
         self.apply_control_points(Utc::now());
+        self.sync_live_pipeline()?;
         Ok(())
     }
 
@@ -372,6 +922,9 @@ impl MixerNode {
             }
         }
         self.apply_control_points(Utc::now());
+        if let Err(err) = self.sync_live_pipeline() {
+            self.last_error = Some(err);
+        }
     }
 
     pub fn apply_control_points(&mut self, at: DateTime<Utc>) {
@@ -412,7 +965,11 @@ impl MixerNode {
         }
     }
 
-    pub fn schedule(&mut self, cue_time: Option<DateTime<Utc>>, end_time: Option<DateTime<Utc>>) {
+    pub fn schedule(
+        &mut self,
+        cue_time: Option<DateTime<Utc>>,
+        end_time: Option<DateTime<Utc>>,
+    ) -> Result<(), String> {
         self.cue_time = cue_time;
         self.end_time = end_time;
         self.last_error = None;
@@ -439,11 +996,26 @@ impl MixerNode {
             }
         };
 
-        self.pipeline =
-            MixerPipelineProfile::from_settings(&self.settings, self.audio_enabled, self.video_enabled, stage);
+        self.pipeline = MixerPipelineProfile::from_settings(
+            &self.settings,
+            self.audio_enabled,
+            self.video_enabled,
+            stage,
+        );
+
+        if let Err(err) = self.sync_live_pipeline() {
+            self.last_error = Some(err.clone());
+            self.state = State::Stopped;
+            self.pipeline.stage = MixerPipelineStage::Idle;
+            self.teardown_live_pipeline();
+            return Err(err);
+        }
+
+        Ok(())
     }
 
     pub fn stop(&mut self) {
+        self.teardown_live_pipeline();
         self.state = State::Stopped;
         self.pipeline.stage = MixerPipelineStage::Idle;
     }
@@ -465,5 +1037,26 @@ impl MixerNode {
             slot_settings: self.slot_settings.clone(),
             slot_control_points: self.slot_control_points.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schedule_without_gstreamer_init_keeps_state_machine_behavior() {
+        let mut node = MixerNode::new("mixer-test".to_string(), None, false, true).unwrap();
+        node.connect_input_slot("slot-video", false, true, None)
+            .unwrap();
+
+        assert!(node.schedule(None, None).is_ok());
+        assert_eq!(node.state, State::Started);
+        assert!(node.live_pipeline.is_none());
+
+        let cue = Utc::now() + Duration::seconds(20);
+        assert!(node.schedule(Some(cue), None).is_ok());
+        assert_eq!(node.state, State::Initial);
+        assert!(node.live_pipeline.is_none());
     }
 }

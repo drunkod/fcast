@@ -1,8 +1,10 @@
 use crate::migration::{
+    media_bridge::StreamBridge,
     nodes::{DestinationNode, MixerNode, SourceNode, VideoGeneratorNode},
     protocol::{Command, CommandResult, ControlPoint, Info, NodeInfo},
 };
 use chrono::{DateTime, Utc};
+use gst_app::{AppSink, AppSrc};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -73,15 +75,9 @@ impl NodeRecord {
         end_time: Option<DateTime<Utc>>,
     ) -> Result<(), String> {
         match self {
-            Self::Source(node) => {
-                node.schedule(cue_time, end_time);
-                Ok(())
-            }
+            Self::Source(node) => node.schedule(cue_time, end_time),
             Self::Destination(node) => node.schedule(cue_time, end_time),
-            Self::Mixer(node) => {
-                node.schedule(cue_time, end_time);
-                Ok(())
-            }
+            Self::Mixer(node) => node.schedule(cue_time, end_time),
             Self::VideoGenerator(node) => node.schedule(cue_time, end_time),
         }
     }
@@ -121,6 +117,39 @@ impl NodeRecord {
             Self::Destination(_) => {}
         }
     }
+
+    fn output_audio_appsink(&self) -> Option<AppSink> {
+        match self {
+            Self::Source(node) => node.live_audio_appsink(),
+            Self::Mixer(node) => node.live_audio_output_appsink(),
+            Self::VideoGenerator(_) | Self::Destination(_) => None,
+        }
+    }
+
+    fn output_video_appsink(&self) -> Option<AppSink> {
+        match self {
+            Self::Source(node) => node.live_video_appsink(),
+            Self::Mixer(node) => node.live_video_output_appsink(),
+            Self::VideoGenerator(node) => node.live_video_appsink(),
+            Self::Destination(_) => None,
+        }
+    }
+
+    fn input_audio_appsrc(&self, link_id: &str) -> Option<AppSrc> {
+        match self {
+            Self::Destination(node) => node.live_audio_appsrc(),
+            Self::Mixer(node) => node.live_slot_audio_appsrc(link_id),
+            Self::Source(_) | Self::VideoGenerator(_) => None,
+        }
+    }
+
+    fn input_video_appsrc(&self, link_id: &str) -> Option<AppSrc> {
+        match self {
+            Self::Destination(node) => node.live_video_appsrc(),
+            Self::Mixer(node) => node.live_slot_video_appsrc(link_id),
+            Self::Source(_) | Self::VideoGenerator(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -128,17 +157,129 @@ pub struct NodeManager {
     started: bool,
     nodes: HashMap<String, NodeRecord>,
     links: HashMap<String, LinkRecord>,
+    media_bridges: HashMap<String, StreamBridge>,
 }
 
 impl NodeManager {
+    fn gst_initialized() -> bool {
+        unsafe { gst::ffi::gst_is_initialized() != 0 }
+    }
+
+    fn bridge_key(src_id: &str, media: &str) -> String {
+        format!("{src_id}:{media}")
+    }
+
+    fn remove_media_bridge_link(&mut self, src_id: &str, link_id: &str, audio: bool, video: bool) {
+        if audio {
+            let key = Self::bridge_key(src_id, "audio");
+            let mut remove_bridge = false;
+            if let Some(bridge) = self.media_bridges.get_mut(&key) {
+                bridge.remove_consumer(link_id);
+                if !bridge.has_consumers() {
+                    bridge.clear();
+                    remove_bridge = true;
+                }
+            }
+            if remove_bridge {
+                self.media_bridges.remove(&key);
+            }
+        }
+        if video {
+            let key = Self::bridge_key(src_id, "video");
+            let mut remove_bridge = false;
+            if let Some(bridge) = self.media_bridges.get_mut(&key) {
+                bridge.remove_consumer(link_id);
+                if !bridge.has_consumers() {
+                    bridge.clear();
+                    remove_bridge = true;
+                }
+            }
+            if remove_bridge {
+                self.media_bridges.remove(&key);
+            }
+        }
+    }
+
+    fn sync_media_links(&mut self) {
+        if !Self::gst_initialized() {
+            return;
+        }
+
+        let links = self
+            .links
+            .iter()
+            .map(|(id, link)| (id.clone(), link.clone()))
+            .collect::<Vec<_>>();
+
+        for (link_id, link) in links {
+            let Some(src_node) = self.nodes.get(&link.src_id) else {
+                self.remove_media_bridge_link(&link.src_id, &link_id, link.audio, link.video);
+                continue;
+            };
+            let Some(sink_node) = self.nodes.get(&link.sink_id) else {
+                self.remove_media_bridge_link(&link.src_id, &link_id, link.audio, link.video);
+                continue;
+            };
+
+            if link.audio {
+                let key = Self::bridge_key(&link.src_id, "audio");
+                let bridge = self.media_bridges.entry(key).or_default();
+                if let Some(producer_sink) = src_node.output_audio_appsink() {
+                    bridge.attach_sink(&producer_sink);
+                }
+                if let Some(consumer_src) = sink_node.input_audio_appsrc(&link_id) {
+                    bridge.add_consumer(&link_id, &consumer_src);
+                } else {
+                    bridge.remove_consumer(&link_id);
+                }
+            }
+
+            if link.video {
+                let key = Self::bridge_key(&link.src_id, "video");
+                let bridge = self.media_bridges.entry(key).or_default();
+                if let Some(producer_sink) = src_node.output_video_appsink() {
+                    bridge.attach_sink(&producer_sink);
+                }
+                if let Some(consumer_src) = sink_node.input_video_appsrc(&link_id) {
+                    bridge.add_consumer(&link_id, &consumer_src);
+                } else {
+                    bridge.remove_consumer(&link_id);
+                }
+            }
+        }
+
+        let empty_bridge_keys = self
+            .media_bridges
+            .iter()
+            .filter_map(|(key, bridge)| {
+                if bridge.has_consumers() {
+                    None
+                } else {
+                    Some(key.clone())
+                }
+            })
+            .collect::<Vec<_>>();
+
+        for key in empty_bridge_keys {
+            if let Some(mut bridge) = self.media_bridges.remove(&key) {
+                bridge.clear();
+            }
+        }
+    }
+
     pub fn start(&mut self) {
         self.started = true;
+        self.sync_media_links();
     }
 
     pub fn shutdown(&mut self) {
         self.started = false;
         self.nodes.clear();
         self.links.clear();
+        for bridge in self.media_bridges.values_mut() {
+            bridge.clear();
+        }
+        self.media_bridges.clear();
     }
 
     pub fn dispatch(&mut self, command: Command) -> CommandResult {
@@ -146,26 +287,26 @@ impl NodeManager {
             self.started = true;
         }
 
-        match command {
-            Command::CreateVideoGenerator { id } => self.create_video_generator(id),
+        let (result, should_sync) = match command {
+            Command::CreateVideoGenerator { id } => (self.create_video_generator(id), true),
             Command::CreateSource {
                 id,
                 uri,
                 audio,
                 video,
-            } => self.create_source(id, uri, audio, video),
+            } => (self.create_source(id, uri, audio, video), true),
             Command::CreateDestination {
                 id,
                 family,
                 audio,
                 video,
-            } => self.create_destination(id, family, audio, video),
+            } => (self.create_destination(id, family, audio, video), true),
             Command::CreateMixer {
                 id,
                 config,
                 audio,
                 video,
-            } => self.create_mixer(id, config, audio, video),
+            } => (self.create_mixer(id, config, audio, video), true),
             Command::Connect {
                 link_id,
                 src_id,
@@ -173,31 +314,46 @@ impl NodeManager {
                 audio,
                 video,
                 config,
-            } => self.connect(link_id, src_id, sink_id, audio, video, config),
-            Command::Disconnect { link_id } => self.disconnect(&link_id),
+            } => (
+                self.connect(link_id, src_id, sink_id, audio, video, config),
+                true,
+            ),
+            Command::Disconnect { link_id } => (self.disconnect(&link_id), true),
             Command::Start {
                 id,
                 cue_time,
                 end_time,
-            } => self.schedule_node(&id, cue_time, end_time),
+            } => (self.schedule_node(&id, cue_time, end_time), true),
             Command::Reschedule {
                 id,
                 cue_time,
                 end_time,
-            } => self.schedule_node(&id, cue_time, end_time),
-            Command::Remove { id } => self.remove_node(&id),
-            Command::GetInfo { id } => self.get_info(id.as_ref()),
+            } => (self.schedule_node(&id, cue_time, end_time), true),
+            Command::Remove { id } => (self.remove_node(&id), true),
+            Command::GetInfo { id } => (self.get_info(id.as_ref()), false),
             Command::AddControlPoint {
                 controllee_id,
                 property,
                 control_point,
-            } => self.add_control_point(&controllee_id, &property, control_point),
+            } => (
+                self.add_control_point(&controllee_id, &property, control_point),
+                true,
+            ),
             Command::RemoveControlPoint {
                 id,
                 controllee_id,
                 property,
-            } => self.remove_control_point(&id, &controllee_id, &property),
+            } => (
+                self.remove_control_point(&id, &controllee_id, &property),
+                true,
+            ),
+        };
+
+        if should_sync {
+            self.sync_media_links();
         }
+
+        result
     }
 
     fn ensure_unique_id(&self, id: &str) -> Result<(), String> {
@@ -362,6 +518,8 @@ impl NodeManager {
         let Some(link) = self.links.remove(link_id) else {
             return CommandResult::Error(format!("No link with id {link_id}"));
         };
+
+        self.remove_media_bridge_link(&link.src_id, link_id, link.audio, link.video);
 
         if let Some(src) = self.nodes.get_mut(&link.src_id) {
             src.remove_consumer_link(link_id);
