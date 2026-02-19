@@ -14,11 +14,16 @@ export global Bridge {
         // "Device 1", "Device 2",
     ];
     in-out property <AppState> app-state: AppState.Disconnected;
+    in-out property <string> test-status: "";
 
     callback connect-receiver(string);
     callback start-casting(scale-width: int, scale-height: int, max-framerate: int);
     callback stop-casting();
     callback scan-qr();
+    callback start-migrated-server();
+    callback test-legacy-getinfo();
+    callback test-legacy-crossfade();
+    callback test-smoke-graph();
 
     public function change-state(to: AppState) {
         Bridge.app-state = to;
@@ -74,6 +79,37 @@ component ConnectView inherits Rectangle {
                     text: "Scan QR";
                 }
             }
+        }
+
+        Text {
+            horizontal-alignment: center;
+            font-size: 12px;
+            text: "Migrated server tests";
+        }
+
+        Button {
+            text: "Start Migrated Server";
+            clicked => Bridge.start-migrated-server();
+        }
+
+        Button {
+            text: "Test Legacy GetInfo";
+            clicked => Bridge.test-legacy-getinfo();
+        }
+
+        Button {
+            text: "Test Legacy Crossfade";
+            clicked => Bridge.test-legacy-crossfade();
+        }
+
+        Button {
+            text: "Test Graph Smoke";
+            clicked => Bridge.test-smoke-graph();
+        }
+
+        Text {
+            wrap: word-wrap;
+            text: Bridge.test-status;
         }
     }
 }

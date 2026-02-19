@@ -66,6 +66,7 @@ Migrate the old `old-version/rust-android-examples/agdk-eframe/src` command API 
 - [x] Add focused node-level scheduling test coverage for migration `DestinationNode`.
 - [x] Add focused node-level scheduling test coverage for migration `MixerNode`.
 - [ ] Run Android device smoke test with JNI command ingress.
+- [x] Create Android UI path to trigger and view smoke test results.
 - [x] Validate compatibility against legacy controller client scripts.
 
 ## Phase 6: True Media Parity (In Progress)
@@ -83,6 +84,7 @@ Migrate the old `old-version/rust-android-examples/agdk-eframe/src` command API 
 - [x] Port EOS and async bus transition behavior from old `domain/nodes/*`.
 
 ## Risks / Follow-ups
+- [ ] Explore old server behavior documented in `old-version/rust-android-examples/explain.md` and map remaining `/command` parity gaps.
 - [x] Replace metadata-only node internals with richer parity runtime models from old `domain/nodes/*`.
 - [x] Replace runtime models with real GStreamer pipeline behavior from old `domain/nodes/*`.
 - [x] Wire migrated node producer/consumer media flow end-to-end (`appsink` -> `appsrc`) for true data-path parity.

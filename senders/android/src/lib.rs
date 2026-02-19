@@ -8,7 +8,13 @@ use jni::{
 };
 use mcore::{transmission::WhepSink, DeviceEvent, Event, ShouldQuit, SourceConfig};
 use parking_lot::{Condvar, Mutex};
-use std::{collections::HashMap, net::Ipv6Addr, sync::Arc};
+#[cfg(target_os = "android")]
+use serde_json::{json, Value};
+use std::{
+    collections::HashMap,
+    net::Ipv6Addr,
+    sync::Arc,
+};
 use tracing::{debug, error};
 
 pub mod migration;
@@ -35,6 +41,374 @@ macro_rules! log_err {
             error!(?err, $msg);
         }
     };
+}
+
+#[cfg(target_os = "android")]
+const MIGRATION_COMMAND_BIND_ENV: &str = "MIGRATION_COMMAND_BIND";
+#[cfg(target_os = "android")]
+const LEGACY_COMMAND_BIND_ADDR: &str = "0.0.0.0:8080";
+
+#[cfg(target_os = "android")]
+fn command_probe_addr(bind_addr: &str) -> String {
+    if let Some(port) = bind_addr.strip_prefix("0.0.0.0:") {
+        return format!("127.0.0.1:{port}");
+    }
+    if let Some(port) = bind_addr.strip_prefix("[::]:") {
+        return format!("[::1]:{port}");
+    }
+    bind_addr.to_string()
+}
+
+#[cfg(target_os = "android")]
+fn send_http_request(
+    bind_addr: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> std::result::Result<String, String> {
+    use std::io::{Read, Write};
+
+    let connect_addr = command_probe_addr(bind_addr);
+    let mut stream = std::net::TcpStream::connect(&connect_addr)
+        .map_err(|err| format!("Failed to connect to migrated server {connect_addr}: {err}"))?;
+
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(3)));
+
+    let body_text = body.unwrap_or("");
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {connect_addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_text}",
+        body_text.len()
+    );
+
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|err| format!("Failed to write HTTP request to migrated server: {err}"))?;
+    stream
+        .flush()
+        .map_err(|err| format!("Failed to flush HTTP request to migrated server: {err}"))?;
+
+    let mut response_bytes = Vec::new();
+    stream
+        .read_to_end(&mut response_bytes)
+        .map_err(|err| format!("Failed to read HTTP response from migrated server: {err}"))?;
+
+    let response = String::from_utf8_lossy(&response_bytes);
+    let mut sections = response.splitn(2, "\r\n\r\n");
+    let headers = sections.next().unwrap_or("");
+    let response_body = sections.next().unwrap_or("").to_string();
+    let status_line = headers.lines().next().unwrap_or("HTTP/1.1 000");
+    if !status_line.contains(" 200 ") {
+        return Err(format!(
+            "Migrated server returned non-200 status: {status_line}; body={response_body}"
+        ));
+    }
+    Ok(response_body)
+}
+
+#[cfg(target_os = "android")]
+fn start_migrated_command_server(bind_addr: &str) -> std::result::Result<String, String> {
+    std::env::set_var(MIGRATION_COMMAND_BIND_ENV, bind_addr);
+    crate::migration::runtime::start_graph_runtime()
+        .map_err(|err| format!("Failed to start migrated graph runtime: {err}"))?;
+    let health_body = send_http_request(bind_addr, "GET", "/health", None)?;
+    Ok(format!(
+        "migrated server active bind={bind_addr} health={}",
+        health_body.trim()
+    ))
+}
+
+#[cfg(target_os = "android")]
+fn run_graph_http_command(
+    bind_addr: &str,
+    payload: Value,
+) -> std::result::Result<Value, String> {
+    let payload_json = payload.to_string();
+    let body = send_http_request(bind_addr, "POST", "/command", Some(&payload_json))?;
+    let response: Value = serde_json::from_str(&body)
+        .map_err(|err| format!("Failed to parse migrated server response: {err}; raw={body}"))?;
+    let result = response
+        .get("result")
+        .ok_or_else(|| format!("Missing result in migrated server response: {body}"))?;
+
+    if let Some(err) = result.get("error").and_then(Value::as_str) {
+        return Err(format!("Migrated server command error: {err}"));
+    }
+
+    Ok(response)
+}
+
+#[cfg(target_os = "android")]
+fn run_graph_command(action: &str, params: Value) -> std::result::Result<Value, String> {
+    let payload = json!({ action: params });
+    let response_json = crate::migration::runtime::try_handle_command_json(&payload.to_string());
+    let root: Value = serde_json::from_str(&response_json)
+        .map_err(|err| format!("{action} parse failure: {err}; raw={response_json}"))?;
+    let result = root
+        .get("result")
+        .cloned()
+        .ok_or_else(|| format!("{action} missing result field; raw={response_json}"))?;
+    match &result {
+        Value::String(ok) if ok == "success" => Ok(result),
+        Value::Object(map) => {
+            if let Some(err) = map.get("error").and_then(Value::as_str) {
+                Err(format!("{action} error: {err}"))
+            } else {
+                Ok(result)
+            }
+        }
+        _ => Err(format!("{action} unsupported result shape: {response_json}")),
+    }
+}
+
+#[cfg(target_os = "android")]
+fn run_legacy_http_getinfo_test(bind_addr: &str) -> String {
+    if let Err(err) = start_migrated_command_server(bind_addr) {
+        return format!("FAIL {err}");
+    }
+
+    match run_graph_http_command(bind_addr, json!({ "getinfo": {} })) {
+        Ok(info) => {
+            let node_count = info
+                .get("result")
+                .and_then(|result| result.get("info"))
+                .and_then(|info| info.get("nodes"))
+                .and_then(Value::as_object)
+                .map(|nodes| nodes.len())
+                .unwrap_or(0);
+            format!("PASS legacy getinfo (/command) nodes={node_count}")
+        }
+        Err(err) => format!("FAIL {err}"),
+    }
+}
+
+#[cfg(target_os = "android")]
+fn run_legacy_http_crossfade_test(bind_addr: &str) -> String {
+    if let Err(err) = start_migrated_command_server(bind_addr) {
+        return format!("FAIL {err}");
+    }
+
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let mixer_id = format!("legacy-channel-{millis}");
+    let destination_id = format!("legacy-output-{millis}");
+    let link_id = format!("{mixer_id}->{destination_id}-{millis}");
+    let slot_source_id = format!("legacy-source-slot-{millis}");
+    let slot_link_id = format!("{slot_source_id}->{mixer_id}-{millis}");
+
+    let mut mixer_created = false;
+    let mut destination_created = false;
+    let mut slot_source_created = false;
+
+    let result = (|| -> std::result::Result<String, String> {
+        // Derived from scripts_test_api/crossfade.py bootstrap sequence.
+        run_graph_http_command(
+            bind_addr,
+            json!({
+                "createmixer": {
+                    "id": mixer_id.clone(),
+                    "config": {
+                        "width": 1280,
+                        "height": 720,
+                        "sample-rate": 44100
+                    }
+                }
+            }),
+        )?;
+        mixer_created = true;
+
+        run_graph_http_command(
+            bind_addr,
+            json!({
+                "createdestination": {
+                    "id": destination_id.clone(),
+                    "family": "LocalPlayback"
+                }
+            }),
+        )?;
+        destination_created = true;
+
+        run_graph_http_command(
+            bind_addr,
+            json!({
+                "connect": {
+                    "link_id": link_id.clone(),
+                    "src_id": mixer_id.clone(),
+                    "sink_id": destination_id.clone()
+                }
+            }),
+        )?;
+        run_graph_http_command(
+            bind_addr,
+            json!({
+                "start": {
+                    "id": destination_id.clone()
+                }
+            }),
+        )?;
+        run_graph_http_command(
+            bind_addr,
+            json!({
+                "start": {
+                    "id": mixer_id.clone()
+                }
+            }),
+        )?;
+
+        run_graph_http_command(
+            bind_addr,
+            json!({
+                "createvideogenerator": {
+                    "id": slot_source_id.clone()
+                }
+            }),
+        )?;
+        slot_source_created = true;
+
+        run_graph_http_command(
+            bind_addr,
+            json!({
+                "connect": {
+                    "link_id": slot_link_id.clone(),
+                    "src_id": slot_source_id.clone(),
+                    "sink_id": mixer_id.clone(),
+                    "audio": false,
+                    "video": true,
+                    "config": {
+                        "video::zorder": 2,
+                        "video::alpha": 1.0,
+                        "audio::volume": 1.0,
+                        "video::width": 1280,
+                        "video::height": 720,
+                        "video::sizing-policy": "keep-aspect-ratio"
+                    }
+                }
+            }),
+        )?;
+        run_graph_http_command(
+            bind_addr,
+            json!({
+                "start": {
+                    "id": slot_source_id.clone()
+                }
+            }),
+        )?;
+
+        let info = run_graph_http_command(bind_addr, json!({ "getinfo": {} }))?;
+        let node_count = info
+            .get("result")
+            .and_then(|result| result.get("info"))
+            .and_then(|info| info.get("nodes"))
+            .and_then(Value::as_object)
+            .map(|nodes| nodes.len())
+            .unwrap_or(0);
+        Ok(format!(
+            "legacy crossfade bootstrap ok mixer={mixer_id} destination={destination_id} slot_source={slot_source_id} nodes={node_count}"
+        ))
+    })();
+
+    if slot_source_created {
+        let _ = run_graph_http_command(
+            bind_addr,
+            json!({
+                "remove": {
+                    "id": slot_source_id.clone()
+                }
+            }),
+        );
+    }
+    if destination_created {
+        let _ = run_graph_http_command(
+            bind_addr,
+            json!({
+                "remove": {
+                    "id": destination_id.clone()
+                }
+            }),
+        );
+    }
+    if mixer_created {
+        let _ = run_graph_http_command(
+            bind_addr,
+            json!({
+                "remove": {
+                    "id": mixer_id.clone()
+                }
+            }),
+        );
+    }
+
+    match result {
+        Ok(success) => format!("PASS {success}"),
+        Err(err) => format!("FAIL {err}"),
+    }
+}
+
+#[cfg(target_os = "android")]
+fn run_graph_smoke_test() -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let source_id = format!("slint-smoke-videogen-{millis}");
+    let mixer_id = format!("slint-smoke-mixer-{millis}");
+    let link_id = format!("slint-smoke-link-{millis}");
+
+    let mut source_created = false;
+    let mut mixer_created = false;
+    let result = (|| -> std::result::Result<String, String> {
+        run_graph_command("createvideogenerator", json!({ "id": source_id.clone() }))?;
+        source_created = true;
+
+        run_graph_command(
+            "createmixer",
+            json!({
+                "id": mixer_id.clone(),
+                "audio": false,
+                "video": true
+            }),
+        )?;
+        mixer_created = true;
+
+        run_graph_command(
+            "connect",
+            json!({
+                "link_id": link_id.clone(),
+                "src_id": source_id.clone(),
+                "sink_id": mixer_id.clone(),
+                "audio": false,
+                "video": true
+            }),
+        )?;
+        run_graph_command("start", json!({ "id": mixer_id.clone() }))?;
+        run_graph_command("start", json!({ "id": source_id.clone() }))?;
+
+        let info = run_graph_command("getinfo", json!({}))?;
+        let node_count = info
+            .get("info")
+            .and_then(|info| info.get("nodes"))
+            .and_then(Value::as_object)
+            .map(|nodes| nodes.len())
+            .unwrap_or(0);
+
+        Ok(format!(
+            "smoke ok source={source_id} mixer={mixer_id} link={link_id} nodes={node_count}"
+        ))
+    })();
+
+    if source_created {
+        let _ = run_graph_command("remove", json!({ "id": source_id.clone() }));
+    }
+    if mixer_created {
+        let _ = run_graph_command("remove", json!({ "id": mixer_id.clone() }));
+    }
+
+    match result {
+        Ok(success) => format!("PASS {success}"),
+        Err(err) => format!("FAIL {err}"),
+    }
 }
 
 #[derive(Debug)]
@@ -558,6 +932,87 @@ fn android_main(app: PlatformApp) {
         let android_app = app_clone.clone();
         move || {
             call_java_method_no_args(&android_app, JavaMethod::ScanQr);
+        }
+    });
+
+    ui.global::<Bridge>().on_start_migrated_server({
+        let ui_weak = ui.as_weak();
+        move || {
+            let status = match start_migrated_command_server(LEGACY_COMMAND_BIND_ADDR) {
+                Ok(message) => format!("PASS {message}"),
+                Err(err) => format!("FAIL {err}"),
+            };
+            if let Err(err) = ui_weak.upgrade_in_event_loop(move |ui| {
+                ui.global::<Bridge>().set_test_status(status.into());
+            }) {
+                error!(?err, "Failed to update migrated server status in UI");
+            }
+        }
+    });
+
+    ui.global::<Bridge>().on_test_legacy_getinfo({
+        let ui_weak = ui.as_weak();
+        move || {
+            if let Err(err) = ui_weak.upgrade_in_event_loop(|ui| {
+                ui.global::<Bridge>()
+                    .set_test_status("Running legacy getinfo test...".into());
+            }) {
+                error!(?err, "Failed to set running legacy getinfo status");
+            }
+
+            let ui_weak_for_result = ui_weak.clone();
+            std::thread::spawn(move || {
+                let status = run_legacy_http_getinfo_test(LEGACY_COMMAND_BIND_ADDR);
+                if let Err(err) = ui_weak_for_result.upgrade_in_event_loop(move |ui| {
+                    ui.global::<Bridge>().set_test_status(status.into());
+                }) {
+                    error!(?err, "Failed to update legacy getinfo status in UI");
+                }
+            });
+        }
+    });
+
+    ui.global::<Bridge>().on_test_legacy_crossfade({
+        let ui_weak = ui.as_weak();
+        move || {
+            if let Err(err) = ui_weak.upgrade_in_event_loop(|ui| {
+                ui.global::<Bridge>()
+                    .set_test_status("Running legacy crossfade test...".into());
+            }) {
+                error!(?err, "Failed to set running legacy crossfade status");
+            }
+
+            let ui_weak_for_result = ui_weak.clone();
+            std::thread::spawn(move || {
+                let status = run_legacy_http_crossfade_test(LEGACY_COMMAND_BIND_ADDR);
+                if let Err(err) = ui_weak_for_result.upgrade_in_event_loop(move |ui| {
+                    ui.global::<Bridge>().set_test_status(status.into());
+                }) {
+                    error!(?err, "Failed to update legacy crossfade status in UI");
+                }
+            });
+        }
+    });
+
+    ui.global::<Bridge>().on_test_smoke_graph({
+        let ui_weak = ui.as_weak();
+        move || {
+            if let Err(err) = ui_weak.upgrade_in_event_loop(|ui| {
+                ui.global::<Bridge>()
+                    .set_test_status("Running graph smoke test...".into());
+            }) {
+                error!(?err, "Failed to set running smoke test status");
+            }
+
+            let ui_weak_for_result = ui_weak.clone();
+            std::thread::spawn(move || {
+                let status = run_graph_smoke_test();
+                if let Err(err) = ui_weak_for_result.upgrade_in_event_loop(move |ui| {
+                    ui.global::<Bridge>().set_test_status(status.into());
+                }) {
+                    error!(?err, "Failed to update smoke test status in UI");
+                }
+            });
         }
     });
 
