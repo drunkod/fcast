@@ -30,16 +30,40 @@ GSTREAMER_NDK_BUILD_PATH  := $(GSTREAMER_ROOT)/share/gst-android/ndk-build/
 include $(GSTREAMER_NDK_BUILD_PATH)/plugins.mk
 
 GSTREAMER_PLUGINS := \
-    $(GSTREAMER_PLUGINS_CORE) \
-    $(GSTREAMER_PLUGINS_CODECS) \
-    $(GSTREAMER_PLUGINS_ENCODING) \
-    $(GSTREAMER_PLUGINS_NET) \
-    $(GSTREAMER_PLUGINS_PLAYBACK) \
-    $(GSTREAMER_PLUGINS_SYS) \
-    $(GSTREAMER_PLUGINS_EFFECTS) \
-    $(GSTREAMER_PLUGINS_VIS) \
-    $(GSTREAMER_PLUGINS_CODECS_RESTRICTED) \
-    $(GSTREAMER_PLUGINS_GES)
+    coreelements \
+    app \
+    audioconvert \
+    audiomixer \
+    audiorate \
+    audioresample \
+    audiotestsrc \
+    compositor \
+    gio \
+    rawparse \
+    typefindfunctions \
+    videoconvertscale \
+    videorate \
+    videotestsrc \
+    volume \
+    videofilter \
+    deinterlace \
+    videobox \
+    videocrop \
+    videomixer \
+    playback \
+    uriplaylistbin \
+    tcp \
+    rtsp \
+    rtp \
+    rtpmanager \
+    udp \
+    dtls \
+    srtp \
+    webrtc \
+    nice \
+    rsrtp \
+    rsrtsp \
+    rswebrtc
 
 GSTREAMER_EXTRA_DEPS := \
     glib-2.0 \
@@ -53,8 +77,6 @@ GSTREAMER_EXTRA_DEPS := \
     gstreamer-app-1.0 \
     gstreamer-webrtc-1.0 \
     gstreamer-rtp-1.0 \
-    libsoup-3.0 \
-    json-glib-1.0 \
     gio-2.0 \
     gmodule-2.0
 
