@@ -3,20 +3,43 @@ use std::env;
 fn main() {
     slint_build::compile("ui/main.slint").unwrap();
 
-    // assert_eq!(env::var("CARGO_CFG_TARGET_OS"), Ok("android".to_owned()));
+    // Only Android builds need custom linker paths/libs.
+    let target = env::var("TARGET").unwrap();
+    if !target.contains("android") {
+        println!("cargo:rerun-if-changed=build.rs");
+        println!("cargo:rerun-if-changed=ui/main.slint");
+        return;
+    }
 
     let proj_root = env::current_dir().unwrap();
-    let android_ndk_home = env::var("ANDROID_NDK_ROOT").unwrap();
-    let gst_libs = env::var("GSTREAMER_ROOT_ANDROID").unwrap();
+    let android_ndk_home = match env::var("ANDROID_NDK_ROOT")
+        .or_else(|_| env::var("ANDROID_NDK_HOME"))
+    {
+        Ok(v) => v,
+        Err(_) => {
+            println!("cargo:warning=Skipping Android linker setup in build.rs: ANDROID_NDK_ROOT/ANDROID_NDK_HOME is not set");
+            println!("cargo:rerun-if-changed=build.rs");
+            println!("cargo:rerun-if-changed=app/jni/Android.mk");
+            return;
+        }
+    };
+    let gst_libs = match env::var("GSTREAMER_ROOT_ANDROID") {
+        Ok(v) => v,
+        Err(_) => {
+            println!("cargo:warning=Skipping Android linker setup in build.rs: GSTREAMER_ROOT_ANDROID is not set");
+            println!("cargo:rerun-if-changed=build.rs");
+            println!("cargo:rerun-if-changed=app/jni/Android.mk");
+            return;
+        }
+    };
 
-    let (gst_target_abi, android_target_abi, clang_target_abi) =
-        match std::env::var("TARGET").unwrap().as_str() {
-            "aarch64-linux-android" => ("arm64", "arm64-v8a", "aarch64"),
-            "x86_64-linux-android" => ("x86_64", "x86_64", "x86_64"),
-            "i686-linux-android" => ("x86", "x86", "i686"),
-            "armv7-linux-androideabi" => ("armv7", "armeabi-v7a", "arm"),
-            _ => unimplemented!(),
-        };
+    let (gst_target_abi, android_target_abi, clang_target_abi) = match target.as_str() {
+        "aarch64-linux-android" => ("arm64", "arm64-v8a", "aarch64"),
+        "x86_64-linux-android" => ("x86_64", "x86_64", "x86_64"),
+        "i686-linux-android" => ("x86", "x86", "i686"),
+        "armv7-linux-androideabi" => ("armv7", "armeabi-v7a", "arm"),
+        _ => unimplemented!(),
+    };
 
     let gstreamer_root = gst_libs;
 

@@ -232,6 +232,7 @@ dependencies = [
  "android_logger",
  "anyhow",
  "async-channel",
+ "chrono",
  "crossbeam-channel",
  "fcast-protocol",
  "fcast-sender-sdk",
@@ -245,11 +246,14 @@ dependencies = [
  "mcore",
  "ndk-context",
  "parking_lot",
+ "serde",
+ "serde_json",
  "slint",
  "slint-build",
  "tokio",
  "tracing",
  "tracing-gstreamer",
+ "uuid",
 ]
 
 [[package]]

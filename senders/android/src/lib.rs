@@ -11,6 +11,15 @@ use parking_lot::{Condvar, Mutex};
 use std::{collections::HashMap, net::Ipv6Addr, sync::Arc};
 use tracing::{debug, error};
 
+pub mod migration;
+
+#[cfg(target_os = "android")]
+type PlatformApp = slint::android::AndroidApp;
+
+#[cfg(not(target_os = "android"))]
+#[derive(Clone, Debug, Default)]
+struct PlatformApp;
+
 lazy_static::lazy_static! {
     pub static ref GLOB_EVENT_CHAN: (crossbeam_channel::Sender<Event>, crossbeam_channel::Receiver<Event>)
         = crossbeam_channel::bounded(2);
@@ -34,7 +43,8 @@ enum JavaMethod {
     ScanQr,
 }
 
-fn call_java_method_no_args(app: &slint::android::AndroidApp, method: JavaMethod) {
+#[cfg(target_os = "android")]
+fn call_java_method_no_args(app: &PlatformApp, method: JavaMethod) {
     let vm = unsafe {
         let ptr = app.vm_as_ptr() as *mut jni::sys::JavaVM;
         assert!(!ptr.is_null(), "JavaVM ptr is null");
@@ -60,6 +70,9 @@ fn call_java_method_no_args(app: &slint::android::AndroidApp, method: JavaMethod
     }
 }
 
+#[cfg(not(target_os = "android"))]
+fn call_java_method_no_args(_app: &PlatformApp, _method: JavaMethod) {}
+
 struct Application {
     ui_weak: slint::Weak<MainWindow>,
     event_tx: tokio::sync::mpsc::UnboundedSender<Event>,
@@ -68,7 +81,7 @@ struct Application {
     active_device: Option<Arc<dyn device::CastingDevice>>,
     current_device_id: usize,
     local_address: Option<fcast_sender_sdk::IpAddr>,
-    android_app: slint::android::AndroidApp,
+    android_app: PlatformApp,
     tx_sink: Option<WhepSink>,
     our_source_url: Option<String>,
 }
@@ -77,7 +90,7 @@ impl Application {
     pub async fn new(
         ui_weak: slint::Weak<MainWindow>,
         event_tx: tokio::sync::mpsc::UnboundedSender<Event>,
-        android_app: slint::android::AndroidApp,
+        android_app: PlatformApp,
     ) -> Result<Self> {
         std::thread::spawn({
             let event_tx = event_tx.clone();
@@ -205,7 +218,10 @@ impl Application {
                     error!("No device with name `{device_name}` found");
                 }
             }
-            Event::SignallerStarted { bound_port_v4, bound_port_v6 } => {
+            Event::SignallerStarted {
+                bound_port_v4,
+                bound_port_v6,
+            } => {
                 let Some(addr) = self.local_address.as_ref() else {
                     error!("Local address is missing");
                     return Ok(ShouldQuit::No);
@@ -291,10 +307,13 @@ impl Application {
                                 }
                             }
                         }
+                        _ => {}
                     }
                 }
             }
+            #[cfg(target_os = "android")]
             Event::CaptureStopped => (),
+            #[cfg(target_os = "android")]
             Event::CaptureCancelled => {
                 self.ui_weak.upgrade_in_event_loop(|ui| {
                     ui.global::<Bridge>()
@@ -303,6 +322,7 @@ impl Application {
 
                 self.stop_cast(false).await?;
             }
+            #[cfg(target_os = "android")]
             Event::QrScanResult(result) => {
                 match fcast_sender_sdk::device::device_info_from_url(result) {
                     Some(device_info) => {
@@ -313,6 +333,7 @@ impl Application {
                     }
                 }
             }
+            #[cfg(target_os = "android")]
             Event::CaptureStarted => {
                 let appsrc = gst_app::AppSrc::builder()
                     .caps(
@@ -386,6 +407,7 @@ impl Application {
                     ui.global::<Bridge>().invoke_change_state(AppState::Casting);
                 })?;
             }
+            #[cfg(target_os = "android")]
             Event::StartCast {
                 scale_width,
                 scale_height,
@@ -433,6 +455,16 @@ impl Application {
                         .invoke_change_state(AppState::WaitingForMedia);
                 })?;
             }
+            #[cfg(not(target_os = "android"))]
+            Event::StartCast {
+                scale_width: _,
+                scale_height: _,
+                max_framerate: _,
+                ..
+            } => {
+                debug!("Ignoring StartCast in non-android build of android-sender");
+            }
+            _ => {}
         }
 
         Ok(ShouldQuit::No)
@@ -447,6 +479,9 @@ impl Application {
         gst::log::set_default_threshold(gst::DebugLevel::Fixme);
         gst::init().unwrap();
         debug!("GStreamer version: {:?}", gst::version());
+        if let Err(err) = crate::migration::runtime::start_graph_runtime() {
+            error!(?err, "Failed to start migrated graph runtime");
+        }
 
         // self.add_or_update_device(fcast_sender_sdk::device::DeviceInfo::fcast("Localhost for android emulator".to_owned(), vec![fcast_sender_sdk::IpAddr::v4(10, 0, 2, 2)], 46899))?;
 
@@ -462,14 +497,18 @@ impl Application {
         }
 
         debug!("Quitting event loop");
+        if let Err(err) = crate::migration::runtime::shutdown_graph_runtime() {
+            error!(?err, "Failed to shut down migrated graph runtime");
+        }
 
         Ok(())
     }
 }
 
 // TODO: handle errs
+#[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
-fn android_main(app: slint::android::AndroidApp) {
+fn android_main(app: PlatformApp) {
     android_logger::init_once(
         android_logger::Config::default().with_max_level(log::LevelFilter::Debug),
     );
@@ -544,10 +583,37 @@ fn android_main(app: slint::android::AndroidApp) {
     debug!("Finished");
 }
 
+#[cfg(target_os = "android")]
 fn jstring_to_string<'local>(env: &mut jni::JNIEnv<'local>, s: &JString<'local>) -> Result<String> {
     Ok(env.get_string(s)?.to_string_lossy().to_string())
 }
 
+#[cfg(target_os = "android")]
+#[allow(non_snake_case)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_org_fcast_android_sender_MainActivity_nativeGraphCommand<'local>(
+    mut env: jni::JNIEnv<'local>,
+    _class: jni::objects::JClass<'local>,
+    command_json: jni::objects::JString<'local>,
+) -> jni::sys::jstring {
+    let response = match jstring_to_string(&mut env, &command_json) {
+        Ok(json) => crate::migration::runtime::try_handle_command_json(&json),
+        Err(err) => {
+            error!(?err, "Failed to decode graph command payload from Java");
+            crate::migration::runtime::try_handle_command_json("")
+        }
+    };
+
+    match env.new_string(response) {
+        Ok(jstr) => jstr.into_raw(),
+        Err(err) => {
+            error!(?err, "Failed to allocate Java response string");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
 #[allow(non_snake_case)]
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_org_fcast_android_sender_FCastDiscoveryListener_serviceFound<'local>(
@@ -652,6 +718,7 @@ pub extern "C" fn Java_org_fcast_android_sender_FCastDiscoveryListener_serviceFo
     );
 }
 
+#[cfg(target_os = "android")]
 #[allow(non_snake_case)]
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_org_fcast_android_sender_FCastDiscoveryListener_serviceLost<'local>(
@@ -668,6 +735,7 @@ pub extern "C" fn Java_org_fcast_android_sender_FCastDiscoveryListener_serviceLo
     }
 }
 
+#[cfg(target_os = "android")]
 #[allow(non_snake_case)]
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_org_fcast_android_sender_MainActivity_nativeCaptureStarted<'local>(
@@ -681,6 +749,7 @@ pub extern "C" fn Java_org_fcast_android_sender_MainActivity_nativeCaptureStarte
     );
 }
 
+#[cfg(target_os = "android")]
 #[allow(non_snake_case)]
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_org_fcast_android_sender_MainActivity_nativeCaptureStopped<'local>(
@@ -694,6 +763,7 @@ pub extern "C" fn Java_org_fcast_android_sender_MainActivity_nativeCaptureStoppe
     );
 }
 
+#[cfg(target_os = "android")]
 #[allow(non_snake_case)]
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_org_fcast_android_sender_MainActivity_nativeCaptureCancelled<'local>(
@@ -707,6 +777,7 @@ pub extern "C" fn Java_org_fcast_android_sender_MainActivity_nativeCaptureCancel
     );
 }
 
+#[cfg(target_os = "android")]
 fn process_frame<'local>(
     env: jni::JNIEnv<'local>,
     width: jni::sys::jint,
@@ -846,6 +917,7 @@ fn process_frame<'local>(
     Ok(())
 }
 
+#[cfg(target_os = "android")]
 #[allow(non_snake_case)]
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_org_fcast_android_sender_MainActivity_nativeProcessFrame<'local>(
@@ -862,6 +934,7 @@ pub extern "C" fn Java_org_fcast_android_sender_MainActivity_nativeProcessFrame<
     }
 }
 
+#[cfg(target_os = "android")]
 #[allow(non_snake_case)]
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_org_fcast_android_sender_MainActivity_nativeQrScanResult<'local>(
