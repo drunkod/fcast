@@ -1,4 +1,3 @@
-use std::process::Command;
 #[cfg(target_os = "windows")]
 use std::rc::Rc;
 
@@ -220,16 +219,20 @@ impl SenderArgs {
                 // )
 
                 match args.cmd {
-                    AndroidSenderCommand::Check => cmd!(
-                        sh,
-                        "cargo ndk --target x86_64-linux-android check -p android-sender"
-                    )
-                    .run()?,
-                    AndroidSenderCommand::Clippy => cmd!(
-                        sh,
-                        "cargo ndk --target x86_64-linux-android clippy -p android-sender"
-                    )
-                    .run()?,
+                    AndroidSenderCommand::Check => {
+                        cmd!(
+                            sh,
+                            "cargo check --target x86_64-linux-android -p android-sender"
+                        )
+                        .run()?
+                    }
+                    AndroidSenderCommand::Clippy => {
+                        cmd!(
+                            sh,
+                            "cargo clippy --target x86_64-linux-android -p android-sender"
+                        )
+                        .run()?
+                    }
                     AndroidSenderCommand::BuildLibGst => {
                         let _env_build_system = sh.push_env(
                             "BUILD_SYSTEM",
@@ -279,22 +282,27 @@ impl SenderArgs {
                                     + "/lib/pkgconfig",
                             );
 
-                            let target = target.translate();
+                            let target_triple = target.translate();
+                            let abi_dir = target.abi_dir();
 
-                            let mut args = vec![
-                                "--target",
-                                target,
-                                "-o",
-                                out_dir.as_str(),
-                                "build",
-                                "--package",
-                                "android-sender",
-                            ];
+                            let mut cargo_args =
+                                vec!["build", "--target", target_triple, "--package", "android-sender"];
                             if release {
-                                args.push("--release");
+                                cargo_args.push("--release");
                             }
 
-                            cmd!(sh, "cargo ndk {args...}").run()?;
+                            cmd!(sh, "cargo {cargo_args...}").run()?;
+
+                            let profile = if release { "release" } else { "debug" };
+                            let so_src = concat_path(
+                                &root_path,
+                                &format!("target/{target_triple}/{profile}/libfcastsender.so"),
+                            );
+                            let so_dst_dir = concat_path(&out_dir, abi_dir);
+                            sh.create_dir(&so_dst_dir)?;
+                            let so_dst = concat_path(&so_dst_dir, "libfcastsender.so");
+                            sh.copy_file(&so_src, &so_dst)?;
+                            println!("Copied {so_src} -> {so_dst}");
                         }
                     }
                 }

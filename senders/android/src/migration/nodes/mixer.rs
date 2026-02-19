@@ -1,6 +1,7 @@
 use crate::migration::nodes::control::evaluate_control_points;
 use crate::migration::protocol::{ControlPoint, MixerInfo, MixerSlotInfo, NodeInfo, State};
 use chrono::{DateTime, Duration, Utc};
+use gst::glib::types::Type;
 use gst::prelude::*;
 use gst_app::{AppSink, AppSrc};
 use serde_json::Value;
@@ -259,6 +260,27 @@ impl MixerNode {
             .or_else(|| value.and_then(Value::as_i64).map(|v| v as f64))
     }
 
+    fn parse_i64(value: Option<&Value>) -> Option<i64> {
+        value
+            .and_then(Value::as_i64)
+            .or_else(|| value.and_then(Value::as_f64).map(|v| v as i64))
+    }
+
+    fn parse_u64(value: Option<&Value>) -> Option<u64> {
+        value
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                value
+                    .and_then(Value::as_i64)
+                    .and_then(|v| u64::try_from(v).ok())
+            })
+            .or_else(|| {
+                value
+                    .and_then(Value::as_f64)
+                    .and_then(|v| if v >= 0.0 { Some(v as u64) } else { None })
+            })
+    }
+
     fn slot_has_media(slot: &HashMap<String, Value>, media: &str) -> bool {
         slot.keys()
             .any(|key| key.starts_with(&format!("{media}::")))
@@ -297,7 +319,86 @@ impl MixerNode {
         }
     }
 
-    fn apply_video_slot_properties(pad: &gst::Pad, slot_settings: &HashMap<String, Value>) {
+    fn set_dynamic_pad_property(
+        pad: &gst::Pad,
+        property: &str,
+        value: &Value,
+    ) -> Result<(), String> {
+        let Some(pspec) = pad.find_property(property) else {
+            return Ok(());
+        };
+
+        match pspec.value_type() {
+            Type::BOOL => {
+                let v = value
+                    .as_bool()
+                    .ok_or_else(|| format!("{property} expects a boolean value"))?;
+                pad.set_property(property, v);
+                Ok(())
+            }
+            Type::STRING => {
+                let v = value
+                    .as_str()
+                    .ok_or_else(|| format!("{property} expects a string value"))?;
+                pad.set_property(property, v);
+                Ok(())
+            }
+            Type::I32 => {
+                let raw = Self::parse_i64(Some(value))
+                    .ok_or_else(|| format!("{property} expects a numeric value"))?;
+                let v =
+                    i32::try_from(raw).map_err(|_| format!("{property} is out of i32 range"))?;
+                pad.set_property(property, v);
+                Ok(())
+            }
+            Type::U32 => {
+                let raw = Self::parse_u64(Some(value))
+                    .ok_or_else(|| format!("{property} expects an unsigned numeric value"))?;
+                let v =
+                    u32::try_from(raw).map_err(|_| format!("{property} is out of u32 range"))?;
+                pad.set_property(property, v);
+                Ok(())
+            }
+            Type::I64 => {
+                let v = Self::parse_i64(Some(value))
+                    .ok_or_else(|| format!("{property} expects a numeric value"))?;
+                pad.set_property(property, v);
+                Ok(())
+            }
+            Type::U64 => {
+                let v = Self::parse_u64(Some(value))
+                    .ok_or_else(|| format!("{property} expects an unsigned numeric value"))?;
+                pad.set_property(property, v);
+                Ok(())
+            }
+            Type::F32 => {
+                let v = Self::parse_f64(Some(value))
+                    .ok_or_else(|| format!("{property} expects a numeric value"))?
+                    as f32;
+                pad.set_property(property, v);
+                Ok(())
+            }
+            Type::F64 => {
+                let v = Self::parse_f64(Some(value))
+                    .ok_or_else(|| format!("{property} expects a numeric value"))?;
+                pad.set_property(property, v);
+                Ok(())
+            }
+            value_type if value_type.is_a(Type::ENUM) || value_type.is_a(Type::FLAGS) => {
+                let v = value
+                    .as_str()
+                    .ok_or_else(|| format!("{property} expects a string enum/flag value"))?;
+                pad.set_property_from_str(property, v);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn apply_video_slot_properties(
+        pad: &gst::Pad,
+        slot_settings: &HashMap<String, Value>,
+    ) -> Result<(), String> {
         for (key, value) in slot_settings {
             if !key.starts_with("video::") {
                 continue;
@@ -318,17 +419,34 @@ impl MixerNode {
                         }
                     }
                 }
-                _ => {}
+                _ => {
+                    Self::set_dynamic_pad_property(pad, prop, value)?;
+                }
             }
         }
+        Ok(())
     }
 
-    fn apply_audio_slot_properties(pad: &gst::Pad, slot_settings: &HashMap<String, Value>) {
-        if let Some(v) = Self::parse_f64(slot_settings.get("audio::volume")) {
-            if pad.has_property("volume") {
-                pad.set_property("volume", v);
+    fn apply_audio_slot_properties(
+        pad: &gst::Pad,
+        slot_settings: &HashMap<String, Value>,
+    ) -> Result<(), String> {
+        for (key, value) in slot_settings {
+            if !key.starts_with("audio::") {
+                continue;
+            }
+            let prop = key.trim_start_matches("audio::");
+            if prop == "volume" {
+                if let Some(v) = Self::parse_f64(Some(value)) {
+                    if pad.has_property("volume") {
+                        pad.set_property("volume", v);
+                    }
+                }
+            } else {
+                Self::set_dynamic_pad_property(pad, prop, value)?;
             }
         }
+        Ok(())
     }
 
     fn build_live_pipeline(&self) -> Result<LiveMixerPipeline, String> {
@@ -517,7 +635,7 @@ impl MixerNode {
                         .map_err(|err| {
                             format!("Failed to link video slot `{slot_id}` to mixer: {err:?}")
                         })?;
-                    Self::apply_video_slot_properties(&pad, slot_settings);
+                    Self::apply_video_slot_properties(&pad, slot_settings)?;
                     live_slot.video_pad = Some(pad);
                 }
                 live_slot.video_appsrc = Some(appsrc);
@@ -586,7 +704,7 @@ impl MixerNode {
                         .map_err(|err| {
                             format!("Failed to link audio slot `{slot_id}` to mixer: {err:?}")
                         })?;
-                    Self::apply_audio_slot_properties(&pad, slot_settings);
+                    Self::apply_audio_slot_properties(&pad, slot_settings)?;
                     live_slot.audio_pad = Some(pad);
                 }
                 live_slot.audio_appsrc = Some(appsrc);
@@ -598,7 +716,7 @@ impl MixerNode {
         Ok(live)
     }
 
-    fn apply_live_settings(&mut self) {
+    fn apply_live_settings(&mut self) -> Result<(), String> {
         let width = self.current_width();
         let height = self.current_height();
         let sample_rate = self.current_sample_rate();
@@ -614,14 +732,15 @@ impl MixerNode {
             for (slot_id, live_slot) in &mut live.slots {
                 if let Some(slot_settings) = self.slot_settings.get(slot_id) {
                     if let Some(pad) = live_slot.video_pad.as_ref() {
-                        Self::apply_video_slot_properties(pad, slot_settings);
+                        Self::apply_video_slot_properties(pad, slot_settings)?;
                     }
                     if let Some(pad) = live_slot.audio_pad.as_ref() {
-                        Self::apply_audio_slot_properties(pad, slot_settings);
+                        Self::apply_audio_slot_properties(pad, slot_settings)?;
                     }
                 }
             }
         }
+        Ok(())
     }
 
     fn teardown_live_pipeline(&mut self) {
@@ -641,10 +760,58 @@ impl MixerNode {
                 .all(|slot_id| live.slots.contains_key(slot_id))
     }
 
+    fn poll_bus_messages(&mut self) -> Result<(), String> {
+        let Some(live) = self.live_pipeline.as_ref() else {
+            return Ok(());
+        };
+        let Some(bus) = live.pipeline.bus() else {
+            return Ok(());
+        };
+
+        let mut saw_eos = false;
+        let mut last_error = None;
+        while let Some(message) = bus.timed_pop_filtered(
+            gst::ClockTime::ZERO,
+            &[gst::MessageType::Error, gst::MessageType::Eos],
+        ) {
+            match message.view() {
+                gst::MessageView::Eos(..) => saw_eos = true,
+                gst::MessageView::Error(err) => {
+                    last_error = Some(format!(
+                        "Mixer {} pipeline error from {:?}: {} ({:?})",
+                        self.id,
+                        err.src().map(|s| s.path_string()),
+                        err.error(),
+                        err.debug()
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(err) = last_error {
+            self.last_error = Some(err.clone());
+            self.state = State::Stopped;
+            self.pipeline.stage = MixerPipelineStage::Idle;
+            self.teardown_live_pipeline();
+            return Err(err);
+        }
+
+        if saw_eos {
+            self.state = State::Stopped;
+            self.pipeline.stage = MixerPipelineStage::Idle;
+            self.teardown_live_pipeline();
+        }
+
+        Ok(())
+    }
+
     fn sync_live_pipeline(&mut self) -> Result<(), String> {
         if !Self::gst_initialized() {
             return Ok(());
         }
+
+        self.poll_bus_messages()?;
 
         match self.pipeline.stage {
             MixerPipelineStage::Idle => {
@@ -657,7 +824,7 @@ impl MixerNode {
                     self.live_pipeline = Some(self.build_live_pipeline()?);
                 }
 
-                self.apply_live_settings();
+                self.apply_live_settings()?;
 
                 let target_state = if self.pipeline.stage == MixerPipelineStage::Starting {
                     gst::State::Paused
@@ -670,9 +837,71 @@ impl MixerNode {
                         format!("Failed to set mixer pipeline state to {target_state:?}: {err:?}")
                     })?;
                 }
-                Ok(())
+                self.poll_bus_messages()
             }
         }
+    }
+
+    pub fn refresh(&mut self) -> Result<(), String> {
+        let now = Utc::now();
+        self.apply_control_points(now);
+        self.advance_schedule(now);
+        self.sync_live_pipeline()
+    }
+
+    fn schedule_transition_due(&self, now: DateTime<Utc>) -> Option<State> {
+        match self.state {
+            State::Initial => match self.cue_time {
+                Some(cue) => {
+                    let preroll_at = cue - Duration::seconds(PREROLL_LEAD_TIME_SECONDS);
+                    if now >= preroll_at {
+                        Some(State::Starting)
+                    } else {
+                        None
+                    }
+                }
+                None => Some(State::Started),
+            },
+            State::Starting => {
+                if self.cue_time.map_or(true, |cue| now >= cue) {
+                    Some(State::Started)
+                } else {
+                    None
+                }
+            }
+            State::Started => {
+                if self.end_time.is_some_and(|end| now >= end) {
+                    Some(State::Stopping)
+                } else {
+                    None
+                }
+            }
+            State::Stopping => Some(State::Stopped),
+            State::Stopped => None,
+        }
+    }
+
+    fn apply_state_to_stage(&mut self) {
+        self.pipeline.stage = match self.state {
+            State::Initial | State::Stopping | State::Stopped => MixerPipelineStage::Idle,
+            State::Starting => MixerPipelineStage::Starting,
+            State::Started => MixerPipelineStage::Playing,
+        };
+    }
+
+    fn advance_schedule(&mut self, now: DateTime<Utc>) -> bool {
+        let mut changed = false;
+        while let Some(next_state) = self.schedule_transition_due(now) {
+            if next_state == self.state {
+                break;
+            }
+            self.state = next_state;
+            changed = true;
+        }
+
+        let old_stage = self.pipeline.stage;
+        self.apply_state_to_stage();
+        changed || old_stage != self.pipeline.stage
     }
 
     pub fn new(
@@ -973,34 +1202,21 @@ impl MixerNode {
         self.cue_time = cue_time;
         self.end_time = end_time;
         self.last_error = None;
-        self.apply_control_points(Utc::now());
-
         let now = Utc::now();
-        let stage = match cue_time {
-            Some(cue) => {
-                let preroll_at = cue - Duration::seconds(PREROLL_LEAD_TIME_SECONDS);
-                if now < preroll_at {
-                    self.state = State::Initial;
-                    MixerPipelineStage::Idle
-                } else if now < cue {
-                    self.state = State::Starting;
-                    MixerPipelineStage::Starting
-                } else {
-                    self.state = State::Started;
-                    MixerPipelineStage::Playing
-                }
-            }
-            None => {
-                self.state = State::Started;
-                MixerPipelineStage::Playing
-            }
-        };
+        self.apply_control_points(now);
+        if matches!(
+            self.state,
+            State::Starting | State::Stopping | State::Stopped
+        ) {
+            self.state = State::Initial;
+        }
+        self.advance_schedule(now);
 
         self.pipeline = MixerPipelineProfile::from_settings(
             &self.settings,
             self.audio_enabled,
             self.video_enabled,
-            stage,
+            self.pipeline.stage,
         );
 
         if let Err(err) = self.sync_live_pipeline() {

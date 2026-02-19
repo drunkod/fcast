@@ -334,10 +334,58 @@ impl SourceNode {
         Ok(())
     }
 
+    fn poll_bus_messages(&mut self) -> Result<(), String> {
+        let Some(live) = self.live_pipeline.as_ref() else {
+            return Ok(());
+        };
+        let Some(bus) = live.pipeline.bus() else {
+            return Ok(());
+        };
+
+        let mut saw_eos = false;
+        let mut last_error = None;
+        while let Some(message) = bus.timed_pop_filtered(
+            gst::ClockTime::ZERO,
+            &[gst::MessageType::Error, gst::MessageType::Eos],
+        ) {
+            match message.view() {
+                gst::MessageView::Eos(..) => saw_eos = true,
+                gst::MessageView::Error(err) => {
+                    last_error = Some(format!(
+                        "Source {} pipeline error from {:?}: {} ({:?})",
+                        self.id,
+                        err.src().map(|s| s.path_string()),
+                        err.error(),
+                        err.debug()
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(err) = last_error {
+            self.last_error = Some(err.clone());
+            self.pipeline.stage = SourcePipelineStage::Idle;
+            self.state = State::Stopped;
+            self.teardown_live_pipeline();
+            return Err(err);
+        }
+
+        if saw_eos {
+            self.pipeline.stage = SourcePipelineStage::Idle;
+            self.state = State::Stopped;
+            self.teardown_live_pipeline();
+        }
+
+        Ok(())
+    }
+
     fn sync_live_pipeline(&mut self) -> Result<(), String> {
         if !Self::gst_initialized() {
             return Ok(());
         }
+
+        self.poll_bus_messages()?;
 
         match self.pipeline.stage {
             SourcePipelineStage::Idle => {
@@ -372,9 +420,69 @@ impl SourceNode {
                         live.source.emit_by_name::<()>("unblock", &[]);
                     }
                 }
-                Ok(())
+                self.poll_bus_messages()
             }
         }
+    }
+
+    pub fn refresh(&mut self) -> Result<(), String> {
+        self.advance_schedule(Utc::now());
+        self.sync_live_pipeline()
+    }
+
+    fn schedule_transition_due(&self, now: DateTime<Utc>) -> Option<State> {
+        match self.state {
+            State::Initial => match self.cue_time {
+                Some(cue) => {
+                    let preroll_at = cue - Duration::seconds(PREROLL_LEAD_TIME_SECONDS);
+                    if now >= preroll_at {
+                        Some(State::Starting)
+                    } else {
+                        None
+                    }
+                }
+                None => Some(State::Started),
+            },
+            State::Starting => {
+                if self.cue_time.map_or(true, |cue| now >= cue) {
+                    Some(State::Started)
+                } else {
+                    None
+                }
+            }
+            State::Started => {
+                if self.end_time.is_some_and(|end| now >= end) {
+                    Some(State::Stopping)
+                } else {
+                    None
+                }
+            }
+            State::Stopping => Some(State::Stopped),
+            State::Stopped => None,
+        }
+    }
+
+    fn apply_state_to_stage(&mut self) {
+        self.pipeline.stage = match self.state {
+            State::Initial | State::Stopping | State::Stopped => SourcePipelineStage::Idle,
+            State::Starting => SourcePipelineStage::Prerolling,
+            State::Started => SourcePipelineStage::Playing,
+        };
+    }
+
+    fn advance_schedule(&mut self, now: DateTime<Utc>) -> bool {
+        let mut changed = false;
+        while let Some(next_state) = self.schedule_transition_due(now) {
+            if next_state == self.state {
+                break;
+            }
+            self.state = next_state;
+            changed = true;
+        }
+
+        let old_stage = self.pipeline.stage;
+        self.apply_state_to_stage();
+        changed || old_stage != self.pipeline.stage
     }
 
     pub fn add_consumer_link(&mut self, link_id: &str, audio: bool, video: bool) {
@@ -415,27 +523,13 @@ impl SourceNode {
         self.cue_time = cue_time;
         self.end_time = end_time;
         self.last_error = None;
-
-        let now = Utc::now();
-        self.state = match cue_time {
-            Some(cue) => {
-                let preroll_at = cue - Duration::seconds(PREROLL_LEAD_TIME_SECONDS);
-                if now < preroll_at {
-                    self.pipeline.stage = SourcePipelineStage::Idle;
-                    State::Initial
-                } else if now < cue {
-                    self.pipeline.stage = SourcePipelineStage::Prerolling;
-                    State::Starting
-                } else {
-                    self.pipeline.stage = SourcePipelineStage::Playing;
-                    State::Started
-                }
-            }
-            None => {
-                self.pipeline.stage = SourcePipelineStage::Playing;
-                State::Started
-            }
-        };
+        if matches!(
+            self.state,
+            State::Starting | State::Stopping | State::Stopped
+        ) {
+            self.state = State::Initial;
+        }
+        self.advance_schedule(Utc::now());
 
         if let Err(err) = self.sync_live_pipeline() {
             self.last_error = Some(err.clone());
@@ -491,5 +585,26 @@ mod tests {
         assert!(node.schedule(Some(cue), None).is_ok());
         assert_eq!(node.state, State::Initial);
         assert!(node.live_pipeline.is_none());
+    }
+
+    #[test]
+    fn advance_schedule_transitions_to_stopped_after_end_time() {
+        let mut node = SourceNode::new(
+            "source-test".to_string(),
+            "https://example.com/stream.mp4".to_string(),
+            true,
+            true,
+        );
+
+        let cue = Utc::now() - Duration::seconds(20);
+        let end = Utc::now() - Duration::seconds(1);
+        node.cue_time = Some(cue);
+        node.end_time = Some(end);
+        node.state = State::Initial;
+
+        node.advance_schedule(Utc::now());
+
+        assert_eq!(node.state, State::Stopped);
+        assert_eq!(node.pipeline.stage, SourcePipelineStage::Idle);
     }
 }

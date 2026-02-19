@@ -66,7 +66,7 @@ Migrate the old `old-version/rust-android-examples/agdk-eframe/src` command API 
 - [x] Add focused node-level scheduling test coverage for migration `DestinationNode`.
 - [x] Add focused node-level scheduling test coverage for migration `MixerNode`.
 - [ ] Run Android device smoke test with JNI command ingress.
-- [ ] Validate compatibility against legacy controller client scripts.
+- [x] Validate compatibility against legacy controller client scripts.
 
 ## Phase 6: True Media Parity (In Progress)
 - [x] Port old node scheduling/state behavior into new `nodes/*` runtime models.
@@ -80,12 +80,12 @@ Migrate the old `old-version/rust-android-examples/agdk-eframe/src` command API 
 - [x] Start live GStreamer execution in migration runtime for `DestinationNode` (family pipelines + appsrc wiring + state transitions).
 - [x] Start live GStreamer execution in migration runtime for `MixerNode` (compositor/audiomixer + slot appsrc wiring + state transitions).
 - [x] Replace modeled node profiles with live GStreamer pipeline execution.
-- [ ] Port EOS and async bus transition behavior from old `domain/nodes/*`.
+- [x] Port EOS and async bus transition behavior from old `domain/nodes/*`.
 
 ## Risks / Follow-ups
 - [x] Replace metadata-only node internals with richer parity runtime models from old `domain/nodes/*`.
 - [x] Replace runtime models with real GStreamer pipeline behavior from old `domain/nodes/*`.
 - [x] Wire migrated node producer/consumer media flow end-to-end (`appsink` -> `appsrc`) for true data-path parity.
-- [ ] Add scheduled execution and EOS behavior parity.
-- [ ] Add remote transport endpoint for command ingress if needed (`/command` equivalent).
-- [ ] Map remaining old mixer/source slot property semantics to runtime behavior.
+- [x] Add scheduled execution and EOS behavior parity.
+- [x] Add remote transport endpoint for command ingress if needed (`/command` equivalent).
+- [x] Map remaining old mixer/source slot property semantics to runtime behavior.

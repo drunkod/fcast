@@ -118,6 +118,19 @@ impl NodeRecord {
         }
     }
 
+    fn refresh_runtime(&mut self) {
+        let result = match self {
+            Self::Source(node) => node.refresh(),
+            Self::Destination(node) => node.refresh(),
+            Self::Mixer(node) => node.refresh(),
+            Self::VideoGenerator(node) => node.refresh(),
+        };
+
+        if let Err(err) = result {
+            self.mark_error(err);
+        }
+    }
+
     fn output_audio_appsink(&self) -> Option<AppSink> {
         match self {
             Self::Source(node) => node.live_audio_appsink(),
@@ -163,6 +176,12 @@ pub struct NodeManager {
 impl NodeManager {
     fn gst_initialized() -> bool {
         unsafe { gst::ffi::gst_is_initialized() != 0 }
+    }
+
+    fn refresh_nodes(&mut self) {
+        for node in self.nodes.values_mut() {
+            node.refresh_runtime();
+        }
     }
 
     fn bridge_key(src_id: &str, media: &str) -> String {
@@ -269,6 +288,15 @@ impl NodeManager {
 
     pub fn start(&mut self) {
         self.started = true;
+        self.refresh_nodes();
+        self.sync_media_links();
+    }
+
+    pub fn tick(&mut self) {
+        if !self.started {
+            return;
+        }
+        self.refresh_nodes();
         self.sync_media_links();
     }
 
@@ -286,6 +314,8 @@ impl NodeManager {
         if !self.started {
             self.started = true;
         }
+
+        self.refresh_nodes();
 
         let (result, should_sync) = match command {
             Command::CreateVideoGenerator { id } => (self.create_video_generator(id), true),
@@ -352,6 +382,8 @@ impl NodeManager {
         if should_sync {
             self.sync_media_links();
         }
+
+        self.refresh_nodes();
 
         result
     }

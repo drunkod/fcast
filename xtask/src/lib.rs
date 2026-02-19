@@ -38,4 +38,13 @@ impl AndroidAbiTarget {
             Self::Arm32 => "armv7-linux-androideabi",
         }
     }
+
+    pub fn abi_dir(&self) -> &'static str {
+        match self {
+            Self::X64 => "x86_64",
+            Self::X86 => "x86",
+            Self::Arm64 => "arm64-v8a",
+            Self::Arm32 => "armeabi-v7a",
+        }
+    }
 }

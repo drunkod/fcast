@@ -24,6 +24,18 @@ Add `--target <ARCH>` to specify a single target architecture (possible values: 
 $ cargo xtask sender android build
 ```
 
+#### Optional: Remote graph command endpoint
+
+You can expose a minimal HTTP endpoint compatible with graph command JSON payloads:
+
+```console
+$ MIGRATION_COMMAND_BIND=127.0.0.1:8899 cargo xtask sender android build
+```
+
+At runtime, when `MIGRATION_COMMAND_BIND` is set:
+- `POST /command` accepts the same JSON payload used by JNI `nativeGraphCommand` and returns the JSON `ServerMessage`.
+- `GET /health` returns a simple health response.
+
 #### Building android the app
 
 Use android studio or gradlew:
