@@ -53,7 +53,7 @@ GSTREAMER_EXTRA_DEPS := \
     gstreamer-app-1.0 \
     gstreamer-webrtc-1.0 \
     gstreamer-rtp-1.0 \
-    libsoup-2.4 \
+    libsoup-3.0 \
     json-glib-1.0 \
     gio-2.0 \
     gmodule-2.0
