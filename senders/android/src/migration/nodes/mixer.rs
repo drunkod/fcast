@@ -325,74 +325,109 @@ impl MixerNode {
         value: &Value,
     ) -> Result<(), String> {
         let Some(pspec) = pad.find_property(property) else {
-            return Ok(());
+            return Err(format!(
+                "Pad `{}` has no property `{property}`",
+                pad.name()
+            ));
         };
 
-        match pspec.value_type() {
+        let expected_type = pspec.value_type();
+
+        match expected_type {
             Type::BOOL => {
                 let v = value
                     .as_bool()
                     .ok_or_else(|| format!("{property} expects a boolean value"))?;
-                pad.set_property(property, v);
-                Ok(())
+                Self::set_pad_property_safe(pad, property, v, expected_type)
             }
             Type::STRING => {
                 let v = value
                     .as_str()
                     .ok_or_else(|| format!("{property} expects a string value"))?;
-                pad.set_property(property, v);
-                Ok(())
+                Self::set_pad_property_safe(pad, property, v, expected_type)
             }
             Type::I32 => {
                 let raw = Self::parse_i64(Some(value))
                     .ok_or_else(|| format!("{property} expects a numeric value"))?;
                 let v =
                     i32::try_from(raw).map_err(|_| format!("{property} is out of i32 range"))?;
-                pad.set_property(property, v);
-                Ok(())
+                Self::set_pad_property_safe(pad, property, v, expected_type)
             }
             Type::U32 => {
                 let raw = Self::parse_u64(Some(value))
                     .ok_or_else(|| format!("{property} expects an unsigned numeric value"))?;
                 let v =
                     u32::try_from(raw).map_err(|_| format!("{property} is out of u32 range"))?;
-                pad.set_property(property, v);
-                Ok(())
+                Self::set_pad_property_safe(pad, property, v, expected_type)
             }
             Type::I64 => {
                 let v = Self::parse_i64(Some(value))
                     .ok_or_else(|| format!("{property} expects a numeric value"))?;
-                pad.set_property(property, v);
-                Ok(())
+                Self::set_pad_property_safe(pad, property, v, expected_type)
             }
             Type::U64 => {
                 let v = Self::parse_u64(Some(value))
                     .ok_or_else(|| format!("{property} expects an unsigned numeric value"))?;
-                pad.set_property(property, v);
-                Ok(())
+                Self::set_pad_property_safe(pad, property, v, expected_type)
             }
             Type::F32 => {
                 let v = Self::parse_f64(Some(value))
                     .ok_or_else(|| format!("{property} expects a numeric value"))?
                     as f32;
-                pad.set_property(property, v);
-                Ok(())
+                Self::set_pad_property_safe(pad, property, v, expected_type)
             }
             Type::F64 => {
                 let v = Self::parse_f64(Some(value))
                     .ok_or_else(|| format!("{property} expects a numeric value"))?;
-                pad.set_property(property, v);
-                Ok(())
+                Self::set_pad_property_safe(pad, property, v, expected_type)
             }
             value_type if value_type.is_a(Type::ENUM) || value_type.is_a(Type::FLAGS) => {
                 let v = value
                     .as_str()
                     .ok_or_else(|| format!("{property} expects a string enum/flag value"))?;
-                pad.set_property_from_str(property, v);
-                Ok(())
+                Self::set_pad_property_from_str_safe(pad, property, v, expected_type)
             }
-            _ => Ok(()),
+            _ => Err(format!(
+                "Unsupported value type `{expected_type:?}` for pad property `{property}` on `{}`",
+                pad.name()
+            )),
         }
+    }
+
+    fn set_pad_property_safe<T: Into<gst::glib::Value>>(
+        pad: &gst::Pad,
+        property: &str,
+        value: T,
+        expected_type: Type,
+    ) -> Result<(), String> {
+        let gvalue: gst::glib::Value = value.into();
+        let actual_type = gvalue.type_();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pad.set_property(property, &gvalue);
+        }))
+        .map_err(|_| {
+            format!(
+                "Failed to set `{property}` on pad `{}`: value type `{actual_type:?}`, expected `{expected_type:?}`",
+                pad.name()
+            )
+        })
+    }
+
+    fn set_pad_property_from_str_safe(
+        pad: &gst::Pad,
+        property: &str,
+        value: &str,
+        expected_type: Type,
+    ) -> Result<(), String> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pad.set_property_from_str(property, value);
+        }))
+        .map_err(|_| {
+            format!(
+                "Failed to set `{property}` on pad `{}` from string value `{value}` (expected `{expected_type:?}`)",
+                pad.name()
+            )
+        })
     }
 
     fn apply_video_slot_properties(
@@ -404,25 +439,11 @@ impl MixerNode {
                 continue;
             }
             let prop = key.trim_start_matches("video::");
-            match prop {
-                "x" | "y" | "width" | "height" | "zorder" => {
-                    if let Some(v) = Self::parse_i32(Some(value)) {
-                        if pad.has_property(prop) {
-                            pad.set_property(prop, v);
-                        }
-                    }
-                }
-                "alpha" => {
-                    if let Some(v) = Self::parse_f64(Some(value)) {
-                        if pad.has_property("alpha") {
-                            pad.set_property("alpha", v);
-                        }
-                    }
-                }
-                _ => {
-                    Self::set_dynamic_pad_property(pad, prop, value)?;
-                }
+            if prop == "sizing-policy" {
+                // Kept for legacy payload compatibility even when compositor pad does not expose this property.
+                continue;
             }
+            Self::set_dynamic_pad_property(pad, prop, value)?;
         }
         Ok(())
     }
@@ -436,15 +457,7 @@ impl MixerNode {
                 continue;
             }
             let prop = key.trim_start_matches("audio::");
-            if prop == "volume" {
-                if let Some(v) = Self::parse_f64(Some(value)) {
-                    if pad.has_property("volume") {
-                        pad.set_property("volume", v);
-                    }
-                }
-            } else {
-                Self::set_dynamic_pad_property(pad, prop, value)?;
-            }
+            Self::set_dynamic_pad_property(pad, prop, value)?;
         }
         Ok(())
     }
