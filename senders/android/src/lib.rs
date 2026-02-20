@@ -944,6 +944,7 @@ fn android_main(app: PlatformApp) {
     slint::android::init(app).unwrap();
 
     let ui = MainWindow::new().unwrap();
+    ui.global::<Bridge>().set_show_debug(cfg!(debug_assertions));
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
 

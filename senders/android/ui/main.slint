@@ -1,4 +1,4 @@
-import { VerticalBox, Button, ListView, Spinner } from "std-widgets.slint";
+import { VerticalBox, Button, ListView, ScrollView, Spinner } from "std-widgets.slint";
 import { Utils, VideoResolutionPicker, FrameratePicker } from "../../../sdk/mirroring_core/ui/common.slint";
 
 enum AppState {
@@ -14,6 +14,7 @@ export global Bridge {
         // "Device 1", "Device 2",
     ];
     in-out property <AppState> app-state: AppState.Disconnected;
+    in-out property <bool> show-debug: false;
     in-out property <string> test-status: "";
 
     callback connect-receiver(string);
@@ -39,18 +40,31 @@ component ConnectView inherits Rectangle {
             text: "Connect to your receiver";
         }
 
-        ListView {
+        if Bridge.devices.length == 0: Rectangle {
+            height: 90px;
+            border-radius: 8px;
+            background: #222633;
+
+            Text {
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                color: #B8BECD;
+                text: "Searching for receivers...";
+            }
+        }
+
+        if Bridge.devices.length > 0: ListView {
             for device in Bridge.devices: Rectangle {
                 height: 45px;
 
-                TouchArea {
+                device_ta := TouchArea {
                     clicked => Bridge.connect-receiver(device);
                 }
 
                 Rectangle {
                     width: parent.width - 10px;
                     height: parent.height - 10px;
-                    background: lightsteelblue;
+                    background: device_ta.pressed ? steelblue : lightsteelblue;
                     border-radius: 8px;
                     Text {
                         vertical-alignment: center;
@@ -64,14 +78,14 @@ component ConnectView inherits Rectangle {
         Rectangle {
             height: 45px;
 
-            TouchArea {
+            scan_ta := TouchArea {
                 clicked => Bridge.scan-qr();
             }
 
             Rectangle {
                 width: parent.width - 10px;
                 height: parent.height - 10px;
-                background: lightsteelblue;
+                background: scan_ta.pressed ? steelblue : lightsteelblue;
                 border-radius: 8px;
                 Text {
                     vertical-alignment: center;
@@ -81,35 +95,44 @@ component ConnectView inherits Rectangle {
             }
         }
 
-        Text {
-            horizontal-alignment: center;
-            font-size: 12px;
-            text: "Migrated server tests";
-        }
+        if Bridge.show-debug: VerticalBox {
+            Text {
+                horizontal-alignment: center;
+                font-size: 12px;
+                text: "Migrated server tests";
+            }
 
-        Button {
-            text: "Start Migrated Server";
-            clicked => Bridge.start-migrated-server();
-        }
+            Button {
+                text: "Start Migrated Server";
+                clicked => Bridge.start-migrated-server();
+            }
 
-        Button {
-            text: "Test Legacy GetInfo";
-            clicked => Bridge.test-legacy-getinfo();
-        }
+            Button {
+                text: "Test Legacy GetInfo";
+                clicked => Bridge.test-legacy-getinfo();
+            }
 
-        Button {
-            text: "Test Legacy Crossfade";
-            clicked => Bridge.test-legacy-crossfade();
-        }
+            Button {
+                text: "Test Legacy Crossfade";
+                clicked => Bridge.test-legacy-crossfade();
+            }
 
-        Button {
-            text: "Test Graph Smoke";
-            clicked => Bridge.test-smoke-graph();
-        }
+            Button {
+                text: "Test Graph Smoke";
+                clicked => Bridge.test-smoke-graph();
+            }
 
-        Text {
-            wrap: word-wrap;
-            text: Bridge.test-status;
+            ScrollView {
+                height: 100px;
+                viewport-width: parent.width;
+                viewport-height: status-text.preferred-height;
+
+                status-text := Text {
+                    width: parent.visible-width;
+                    wrap: word-wrap;
+                    text: Bridge.test-status;
+                }
+            }
         }
     }
 }
@@ -118,6 +141,8 @@ component ConnectingView inherits Rectangle {
     VerticalBox {
         Spinner {
             indeterminate: true;
+            width: 48px;
+            height: 48px;
         }
 
         Text {
@@ -165,14 +190,30 @@ component SelectingSettingsView inherits Rectangle {
                 Bridge.start-casting(scale.width, scale.height, Utils.video-framerates[video-framerate-idx].to-float())
             }
         }
+
+        Button {
+            text: "Disconnect";
+            clicked => Bridge.stop-casting();
+        }
     }
 }
 
 component WaitingForMediaView inherits Rectangle {
     VerticalBox {
+        Spinner {
+            indeterminate: true;
+            width: 48px;
+            height: 48px;
+        }
+
         Text {
             horizontal-alignment: center;
             text: "Waiting for media";
+        }
+
+        Button {
+            text: "Cancel";
+            clicked => Bridge.stop-casting();
         }
     }
 }

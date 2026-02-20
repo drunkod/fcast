@@ -1,6 +1,7 @@
 name: Android APK Release
 
 on:
+  push:
   release:
     types: [published]
   workflow_dispatch:
