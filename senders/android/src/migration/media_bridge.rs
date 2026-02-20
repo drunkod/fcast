@@ -128,3 +128,96 @@ impl StreamBridge {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gst::prelude::*;
+    use std::sync::Once;
+
+    fn ensure_gst_init() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            gst::init().unwrap();
+        });
+    }
+
+    fn make_appsrc(name: &str) -> AppSrc {
+        gst::ElementFactory::make("appsrc")
+            .name(name)
+            .build()
+            .unwrap()
+            .downcast::<AppSrc>()
+            .unwrap()
+    }
+
+    fn make_appsink(name: &str) -> AppSink {
+        gst::ElementFactory::make("appsink")
+            .name(name)
+            .build()
+            .unwrap()
+            .downcast::<AppSink>()
+            .unwrap()
+    }
+
+    #[test]
+    fn add_remove_and_clear_manage_consumer_lifecycle() {
+        ensure_gst_init();
+
+        let mut bridge = StreamBridge::default();
+        let src = make_appsrc("bridge-consumer-1");
+        let sink = make_appsink("bridge-sink-1");
+
+        assert!(!bridge.has_consumers());
+        bridge.add_consumer("consumer-1", &src);
+        assert!(bridge.has_consumers());
+        assert_eq!(bridge.consumers.lock().len(), 1);
+
+        bridge.attach_sink(&sink);
+        assert!(bridge.attached_sink.is_some());
+
+        bridge.remove_consumer("consumer-1");
+        assert!(!bridge.has_consumers());
+
+        bridge.add_consumer("consumer-2", &src);
+        bridge.clear();
+        assert!(!bridge.has_consumers());
+        assert!(bridge.attached_sink.is_none());
+        assert!(bridge.last_caps.lock().is_none());
+    }
+
+    #[test]
+    fn add_consumer_applies_cached_caps_to_new_consumer() {
+        ensure_gst_init();
+
+        let mut bridge = StreamBridge::default();
+        let src = make_appsrc("bridge-consumer-2");
+        let caps = gst::Caps::builder("video/x-raw")
+            .field("format", "RGB")
+            .field("width", 1280i32)
+            .field("height", 720i32)
+            .build();
+        *bridge.last_caps.lock() = Some(caps.clone());
+
+        bridge.add_consumer("consumer-1", &src);
+        assert_eq!(src.caps(), Some(caps));
+    }
+
+    #[test]
+    fn attach_sink_replaces_old_sink_and_resets_cached_caps() {
+        ensure_gst_init();
+
+        let mut bridge = StreamBridge::default();
+        let sink1 = make_appsink("bridge-sink-2");
+        let sink2 = make_appsink("bridge-sink-3");
+
+        bridge.attach_sink(&sink1);
+        assert_eq!(bridge.attached_sink.as_ref(), Some(&sink1));
+
+        *bridge.last_caps.lock() = Some(gst::Caps::builder("audio/x-raw").build());
+        bridge.attach_sink(&sink2);
+
+        assert_eq!(bridge.attached_sink.as_ref(), Some(&sink2));
+        assert!(bridge.last_caps.lock().is_none());
+    }
+}

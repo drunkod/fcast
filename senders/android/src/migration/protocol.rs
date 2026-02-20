@@ -208,3 +208,167 @@ pub struct ServerMessage {
     pub id: Option<uuid::Uuid>,
     pub result: CommandResult,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    fn point_at(offset_secs: i64, value: serde_json::Value) -> ControlPoint {
+        ControlPoint {
+            id: format!("cp-{offset_secs}"),
+            time: Utc::now() + Duration::seconds(offset_secs),
+            value,
+            mode: ControlMode::Set,
+        }
+    }
+
+    #[test]
+    fn command_defaults_audio_and_video_to_true_when_omitted() {
+        let source: Command =
+            serde_json::from_str(r#"{"createsource":{"id":"source-1","uri":"file:///a.mp4"}}"#)
+                .unwrap();
+        assert!(matches!(
+            source,
+            Command::CreateSource {
+                audio: true,
+                video: true,
+                ..
+            }
+        ));
+
+        let destination: Command = serde_json::from_str(
+            r#"{"createdestination":{"id":"dest-1","family":"LocalPlayback"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            destination,
+            Command::CreateDestination {
+                audio: true,
+                video: true,
+                ..
+            }
+        ));
+
+        let mixer: Command = serde_json::from_str(r#"{"createmixer":{"id":"mixer-1"}}"#).unwrap();
+        assert!(matches!(
+            mixer,
+            Command::CreateMixer {
+                audio: true,
+                video: true,
+                ..
+            }
+        ));
+
+        let connect: Command = serde_json::from_str(
+            r#"{"connect":{"link_id":"link-1","src_id":"source-1","sink_id":"dest-1"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            connect,
+            Command::Connect {
+                audio: true,
+                video: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn destination_family_roundtrip_includes_all_variants() {
+        let families = [
+            DestinationFamily::Rtmp {
+                uri: "rtmp://localhost/live".to_string(),
+            },
+            DestinationFamily::Udp {
+                host: "127.0.0.1".to_string(),
+            },
+            DestinationFamily::LocalFile {
+                base_name: "capture".to_string(),
+                max_size_time: Some(5_000),
+            },
+            DestinationFamily::LocalPlayback,
+        ];
+
+        for family in families {
+            let encoded = serde_json::to_string(&family).unwrap();
+            let decoded: DestinationFamily = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, family);
+        }
+    }
+
+    #[test]
+    fn control_points_sort_by_timestamp() {
+        let mut points = vec![
+            point_at(20, json!(1.0)),
+            point_at(-10, json!(2.0)),
+            point_at(5, json!(3.0)),
+        ];
+
+        points.sort();
+        assert_eq!(points[0].id, "cp--10");
+        assert_eq!(points[1].id, "cp-5");
+        assert_eq!(points[2].id, "cp-20");
+    }
+
+    #[test]
+    fn controller_and_server_messages_preserve_wire_shape() {
+        let request_id = Uuid::new_v4();
+        let controller = ControllerMessage {
+            id: request_id,
+            command: Command::GetInfo { id: None },
+        };
+
+        let controller_json = serde_json::to_value(&controller).unwrap();
+        let expected_id = request_id.as_hyphenated().to_string();
+        assert_eq!(
+            controller_json
+                .get("id")
+                .and_then(serde_json::Value::as_str),
+            Some(expected_id.as_str())
+        );
+        assert!(controller_json
+            .get("command")
+            .and_then(|v| v.get("getinfo"))
+            .is_some());
+
+        let response = ServerMessage {
+            id: Some(request_id),
+            result: CommandResult::Success,
+        };
+        let response_json = serde_json::to_value(&response).unwrap();
+        assert!(response_json.get("result").is_some());
+
+        let decoded: ServerMessage = serde_json::from_value(response_json).unwrap();
+        assert_eq!(decoded.id, Some(request_id));
+        assert!(matches!(decoded.result, CommandResult::Success));
+    }
+
+    #[test]
+    fn node_info_and_command_result_roundtrip() {
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "source-1".to_string(),
+            NodeInfo::Source(SourceInfo {
+                uri: "videogenerator://source-1".to_string(),
+                video_consumer_slot_ids: Some(vec!["slot-video".to_string()]),
+                audio_consumer_slot_ids: Some(vec!["slot-audio".to_string()]),
+                cue_time: None,
+                end_time: None,
+                state: State::Started,
+            }),
+        );
+
+        let result = CommandResult::Info(Info { nodes });
+        let encoded = serde_json::to_string(&result).unwrap();
+        let decoded: CommandResult = serde_json::from_str(&encoded).unwrap();
+        match decoded {
+            CommandResult::Info(info) => {
+                assert!(info.nodes.contains_key("source-1"));
+            }
+            other => panic!("expected info, got {other:?}"),
+        }
+    }
+}

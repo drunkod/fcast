@@ -47,3 +47,123 @@ pub fn evaluate_control_points(points: &[ControlPoint], at: DateTime<Utc>) -> Op
 
     Some(current.value.clone())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+    use serde_json::json;
+
+    fn point(id: &str, time: DateTime<Utc>, value: Value, mode: ControlMode) -> ControlPoint {
+        ControlPoint {
+            id: id.to_string(),
+            time,
+            value,
+            mode,
+        }
+    }
+
+    #[test]
+    fn evaluate_returns_none_for_empty_points() {
+        assert!(evaluate_control_points(&[], Utc::now()).is_none());
+    }
+
+    #[test]
+    fn evaluate_set_mode_uses_latest_point_at_or_before_timestamp() {
+        let now = Utc::now();
+        let points = vec![
+            point(
+                "a",
+                now - Duration::seconds(10),
+                json!(0.1),
+                ControlMode::Set,
+            ),
+            point(
+                "b",
+                now - Duration::seconds(2),
+                json!(0.5),
+                ControlMode::Set,
+            ),
+            point(
+                "c",
+                now + Duration::seconds(10),
+                json!(0.9),
+                ControlMode::Set,
+            ),
+        ];
+
+        let value = evaluate_control_points(&points, now).unwrap();
+        assert_eq!(value, json!(0.5));
+    }
+
+    #[test]
+    fn evaluate_before_first_point_returns_first_value() {
+        let now = Utc::now();
+        let points = vec![
+            point("a", now + Duration::seconds(3), json!(7), ControlMode::Set),
+            point("b", now + Duration::seconds(5), json!(9), ControlMode::Set),
+        ];
+
+        let value = evaluate_control_points(&points, now).unwrap();
+        assert_eq!(value, json!(7));
+    }
+
+    #[test]
+    fn evaluate_interpolates_numeric_values() {
+        let now = Utc::now();
+        let points = vec![
+            point(
+                "a",
+                now - Duration::seconds(10),
+                json!(10.0),
+                ControlMode::Interpolate,
+            ),
+            point(
+                "b",
+                now + Duration::seconds(10),
+                json!(30.0),
+                ControlMode::Set,
+            ),
+        ];
+
+        let value = evaluate_control_points(&points, now).unwrap();
+        let interpolated = value.as_f64().unwrap();
+        assert!((interpolated - 20.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn evaluate_interpolate_with_non_numeric_values_falls_back_to_current() {
+        let now = Utc::now();
+        let points = vec![
+            point(
+                "a",
+                now - Duration::seconds(1),
+                json!("left"),
+                ControlMode::Interpolate,
+            ),
+            point(
+                "b",
+                now + Duration::seconds(1),
+                json!("right"),
+                ControlMode::Set,
+            ),
+        ];
+
+        let value = evaluate_control_points(&points, now).unwrap();
+        assert_eq!(value, json!("left"));
+    }
+
+    #[test]
+    fn evaluate_interpolate_with_same_timestamp_does_not_divide_by_zero() {
+        let now = Utc::now();
+        let points = vec![point(
+            "a",
+            now + Duration::seconds(1),
+            json!(42.0),
+            ControlMode::Interpolate,
+        )];
+
+        let value = evaluate_control_points(&points, now).unwrap();
+        assert_eq!(value, json!(42.0));
+    }
+}

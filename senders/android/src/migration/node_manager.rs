@@ -722,12 +722,29 @@ impl NodeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migration::protocol::{Command, DestinationFamily};
+    use crate::migration::protocol::{Command, ControlMode, DestinationFamily};
+    use chrono::Duration;
+    use serde_json::json;
+
+    fn started_manager() -> NodeManager {
+        let mut manager = NodeManager::default();
+        manager.start();
+        manager
+    }
+
+    fn expect_error(result: CommandResult, needle: &str) {
+        match result {
+            CommandResult::Error(err) => assert!(
+                err.contains(needle),
+                "expected error containing `{needle}`, got `{err}`"
+            ),
+            other => panic!("expected error containing `{needle}`, got {other:?}"),
+        }
+    }
 
     #[test]
     fn create_connect_and_get_info() {
-        let mut manager = NodeManager::default();
-        manager.start();
+        let mut manager = started_manager();
 
         assert!(matches!(
             manager.dispatch(Command::CreateSource {
@@ -767,5 +784,456 @@ mod tests {
             }
             other => panic!("Expected info result, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn create_video_generator_maps_to_compatible_source_info() {
+        let mut manager = started_manager();
+        assert!(matches!(
+            manager.dispatch(Command::CreateVideoGenerator {
+                id: "gen-1".to_string()
+            }),
+            CommandResult::Success
+        ));
+
+        let result = manager.dispatch(Command::GetInfo {
+            id: Some("gen-1".to_string()),
+        });
+        match result {
+            CommandResult::Info(info) => match info.nodes.get("gen-1") {
+                Some(NodeInfo::Source(source)) => {
+                    assert_eq!(source.uri, "videogenerator://gen-1");
+                }
+                other => panic!("expected compatible source info, got {other:?}"),
+            },
+            other => panic!("expected info result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_commands_validate_flags_ids_and_config() {
+        let mut manager = started_manager();
+
+        expect_error(
+            manager.dispatch(Command::CreateSource {
+                id: "source-disabled".to_string(),
+                uri: "https://example.com/video.mp4".to_string(),
+                audio: false,
+                video: false,
+            }),
+            "must have either audio or video enabled",
+        );
+        expect_error(
+            manager.dispatch(Command::CreateDestination {
+                id: "dest-disabled".to_string(),
+                family: DestinationFamily::LocalPlayback,
+                audio: false,
+                video: false,
+            }),
+            "must have either audio or video enabled",
+        );
+        expect_error(
+            manager.dispatch(Command::CreateMixer {
+                id: "mixer-disabled".to_string(),
+                config: None,
+                audio: false,
+                video: false,
+            }),
+            "must have either audio or video enabled",
+        );
+
+        assert!(matches!(
+            manager.dispatch(Command::CreateSource {
+                id: "dup-id".to_string(),
+                uri: "https://example.com/video.mp4".to_string(),
+                audio: true,
+                video: true,
+            }),
+            CommandResult::Success
+        ));
+        expect_error(
+            manager.dispatch(Command::CreateDestination {
+                id: "dup-id".to_string(),
+                family: DestinationFamily::LocalPlayback,
+                audio: true,
+                video: true,
+            }),
+            "already exists with id dup-id",
+        );
+
+        expect_error(
+            manager.dispatch(Command::CreateMixer {
+                id: "mixer-invalid-config".to_string(),
+                config: Some(HashMap::from([("bad".to_string(), json!(1))])),
+                audio: true,
+                video: true,
+            }),
+            "No setting with name bad",
+        );
+    }
+
+    #[test]
+    fn connect_disconnect_validate_capabilities_and_link_ids() {
+        let mut manager = started_manager();
+
+        assert!(matches!(
+            manager.dispatch(Command::CreateSource {
+                id: "source-audio".to_string(),
+                uri: "https://example.com/audio.mp3".to_string(),
+                audio: true,
+                video: false,
+            }),
+            CommandResult::Success
+        ));
+        assert!(matches!(
+            manager.dispatch(Command::CreateDestination {
+                id: "dest-video".to_string(),
+                family: DestinationFamily::LocalPlayback,
+                audio: false,
+                video: true,
+            }),
+            CommandResult::Success
+        ));
+        assert!(matches!(
+            manager.dispatch(Command::CreateDestination {
+                id: "dest-audio".to_string(),
+                family: DestinationFamily::LocalPlayback,
+                audio: true,
+                video: false,
+            }),
+            CommandResult::Success
+        ));
+
+        expect_error(
+            manager.dispatch(Command::Connect {
+                link_id: "bad-link-media".to_string(),
+                src_id: "source-audio".to_string(),
+                sink_id: "dest-video".to_string(),
+                audio: true,
+                video: false,
+                config: None,
+            }),
+            "capabilities do not match",
+        );
+        expect_error(
+            manager.dispatch(Command::Connect {
+                link_id: "missing-src".to_string(),
+                src_id: "missing".to_string(),
+                sink_id: "dest-audio".to_string(),
+                audio: true,
+                video: false,
+                config: None,
+            }),
+            "No producer with id missing",
+        );
+        expect_error(
+            manager.dispatch(Command::Connect {
+                link_id: "missing-sink".to_string(),
+                src_id: "source-audio".to_string(),
+                sink_id: "missing".to_string(),
+                audio: true,
+                video: false,
+                config: None,
+            }),
+            "No consumer with id missing",
+        );
+
+        let link_config = Some(HashMap::from([("audio::volume".to_string(), json!(0.5))]));
+        assert!(matches!(
+            manager.dispatch(Command::Connect {
+                link_id: "link-1".to_string(),
+                src_id: "source-audio".to_string(),
+                sink_id: "dest-audio".to_string(),
+                audio: true,
+                video: false,
+                config: link_config.clone(),
+            }),
+            CommandResult::Success
+        ));
+        assert_eq!(
+            manager
+                .links
+                .get("link-1")
+                .and_then(|link| link.config.clone()),
+            link_config
+        );
+
+        expect_error(
+            manager.dispatch(Command::Connect {
+                link_id: "link-1".to_string(),
+                src_id: "source-audio".to_string(),
+                sink_id: "dest-audio".to_string(),
+                audio: true,
+                video: false,
+                config: None,
+            }),
+            "already exists with id link-1",
+        );
+
+        assert!(matches!(
+            manager.dispatch(Command::Disconnect {
+                link_id: "link-1".to_string()
+            }),
+            CommandResult::Success
+        ));
+        expect_error(
+            manager.dispatch(Command::Disconnect {
+                link_id: "link-1".to_string(),
+            }),
+            "No link with id link-1",
+        );
+    }
+
+    #[test]
+    fn start_reschedule_and_remove_commands_work_for_nodes() {
+        let mut manager = started_manager();
+        assert!(matches!(
+            manager.dispatch(Command::CreateSource {
+                id: "source-1".to_string(),
+                uri: "https://example.com/video.mp4".to_string(),
+                audio: true,
+                video: true,
+            }),
+            CommandResult::Success
+        ));
+
+        assert!(matches!(
+            manager.dispatch(Command::Start {
+                id: "source-1".to_string(),
+                cue_time: None,
+                end_time: None,
+            }),
+            CommandResult::Success
+        ));
+
+        let cue = Utc::now() + Duration::seconds(20);
+        let end = cue + Duration::seconds(5);
+        assert!(matches!(
+            manager.dispatch(Command::Reschedule {
+                id: "source-1".to_string(),
+                cue_time: Some(cue),
+                end_time: Some(end),
+            }),
+            CommandResult::Success
+        ));
+
+        assert!(matches!(
+            manager.dispatch(Command::Remove {
+                id: "source-1".to_string()
+            }),
+            CommandResult::Success
+        ));
+        expect_error(
+            manager.dispatch(Command::Remove {
+                id: "source-1".to_string(),
+            }),
+            "No node with id source-1",
+        );
+    }
+
+    #[test]
+    fn get_info_reports_missing_node_for_specific_id() {
+        let mut manager = started_manager();
+        expect_error(
+            manager.dispatch(Command::GetInfo {
+                id: Some("missing".to_string()),
+            }),
+            "No node with id missing",
+        );
+    }
+
+    #[test]
+    fn add_and_remove_control_point_supports_mixer_and_mixer_slots() {
+        let mut manager = started_manager();
+
+        assert!(matches!(
+            manager.dispatch(Command::CreateSource {
+                id: "source-1".to_string(),
+                uri: "https://example.com/audio.mp3".to_string(),
+                audio: true,
+                video: false,
+            }),
+            CommandResult::Success
+        ));
+        assert!(matches!(
+            manager.dispatch(Command::CreateMixer {
+                id: "mixer-1".to_string(),
+                config: None,
+                audio: true,
+                video: false,
+            }),
+            CommandResult::Success
+        ));
+        assert!(matches!(
+            manager.dispatch(Command::Connect {
+                link_id: "slot-1".to_string(),
+                src_id: "source-1".to_string(),
+                sink_id: "mixer-1".to_string(),
+                audio: true,
+                video: false,
+                config: None,
+            }),
+            CommandResult::Success
+        ));
+
+        let mixer_cp = ControlPoint {
+            id: "cp-width".to_string(),
+            time: Utc::now(),
+            value: json!(1280),
+            mode: ControlMode::Set,
+        };
+        assert!(matches!(
+            manager.dispatch(Command::AddControlPoint {
+                controllee_id: "mixer-1".to_string(),
+                property: "width".to_string(),
+                control_point: mixer_cp,
+            }),
+            CommandResult::Success
+        ));
+        assert!(matches!(
+            manager.dispatch(Command::RemoveControlPoint {
+                id: "cp-width".to_string(),
+                controllee_id: "mixer-1".to_string(),
+                property: "width".to_string(),
+            }),
+            CommandResult::Success
+        ));
+
+        let slot_cp = ControlPoint {
+            id: "cp-slot".to_string(),
+            time: Utc::now(),
+            value: json!(0.5),
+            mode: ControlMode::Set,
+        };
+        assert!(matches!(
+            manager.dispatch(Command::AddControlPoint {
+                controllee_id: "slot-1".to_string(),
+                property: "audio::volume".to_string(),
+                control_point: slot_cp,
+            }),
+            CommandResult::Success
+        ));
+        assert!(matches!(
+            manager.dispatch(Command::RemoveControlPoint {
+                id: "cp-slot".to_string(),
+                controllee_id: "slot-1".to_string(),
+                property: "audio::volume".to_string(),
+            }),
+            CommandResult::Success
+        ));
+    }
+
+    #[test]
+    fn control_point_commands_return_errors_for_invalid_targets() {
+        let mut manager = started_manager();
+
+        assert!(matches!(
+            manager.dispatch(Command::CreateSource {
+                id: "source-1".to_string(),
+                uri: "https://example.com/audio.mp3".to_string(),
+                audio: true,
+                video: false,
+            }),
+            CommandResult::Success
+        ));
+        assert!(matches!(
+            manager.dispatch(Command::CreateDestination {
+                id: "dest-1".to_string(),
+                family: DestinationFamily::LocalPlayback,
+                audio: true,
+                video: false,
+            }),
+            CommandResult::Success
+        ));
+        assert!(matches!(
+            manager.dispatch(Command::Connect {
+                link_id: "dest-link".to_string(),
+                src_id: "source-1".to_string(),
+                sink_id: "dest-1".to_string(),
+                audio: true,
+                video: false,
+                config: None,
+            }),
+            CommandResult::Success
+        ));
+
+        let cp = ControlPoint {
+            id: "cp-1".to_string(),
+            time: Utc::now(),
+            value: json!(0.5),
+            mode: ControlMode::Set,
+        };
+        expect_error(
+            manager.dispatch(Command::AddControlPoint {
+                controllee_id: "source-1".to_string(),
+                property: "width".to_string(),
+                control_point: cp.clone(),
+            }),
+            "supported only for mixers",
+        );
+        expect_error(
+            manager.dispatch(Command::AddControlPoint {
+                controllee_id: "dest-link".to_string(),
+                property: "audio::volume".to_string(),
+                control_point: cp,
+            }),
+            "only supported for mixer links",
+        );
+        expect_error(
+            manager.dispatch(Command::RemoveControlPoint {
+                id: "cp-1".to_string(),
+                controllee_id: "source-1".to_string(),
+                property: "width".to_string(),
+            }),
+            "supported only for mixers",
+        );
+        expect_error(
+            manager.dispatch(Command::RemoveControlPoint {
+                id: "cp-1".to_string(),
+                controllee_id: "missing".to_string(),
+                property: "width".to_string(),
+            }),
+            "No node or slot with id missing",
+        );
+    }
+
+    #[test]
+    fn shutdown_clears_runtime_state() {
+        let mut manager = started_manager();
+        assert!(matches!(
+            manager.dispatch(Command::CreateSource {
+                id: "source-1".to_string(),
+                uri: "https://example.com/video.mp4".to_string(),
+                audio: true,
+                video: true,
+            }),
+            CommandResult::Success
+        ));
+        assert!(matches!(
+            manager.dispatch(Command::CreateDestination {
+                id: "dest-1".to_string(),
+                family: DestinationFamily::LocalPlayback,
+                audio: true,
+                video: true,
+            }),
+            CommandResult::Success
+        ));
+        assert!(matches!(
+            manager.dispatch(Command::Connect {
+                link_id: "link-1".to_string(),
+                src_id: "source-1".to_string(),
+                sink_id: "dest-1".to_string(),
+                audio: true,
+                video: true,
+                config: None,
+            }),
+            CommandResult::Success
+        ));
+
+        manager.shutdown();
+        assert!(!manager.started);
+        assert!(manager.nodes.is_empty());
+        assert!(manager.links.is_empty());
+        assert!(manager.media_bridges.is_empty());
     }
 }

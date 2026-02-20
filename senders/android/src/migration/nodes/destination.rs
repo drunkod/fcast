@@ -1023,4 +1023,83 @@ mod tests {
             Some(DestinationPipelineStage::Playing)
         );
     }
+
+    #[test]
+    fn schedule_requires_connected_enabled_slots() {
+        let mut node = DestinationNode::new(
+            "destination-test".to_string(),
+            DestinationFamily::LocalPlayback,
+            true,
+            true,
+        );
+
+        let err = node.schedule(None, None).unwrap_err();
+        assert!(err.contains("audio slot connected"));
+
+        node.connect_input("audio-link", true, false).unwrap();
+        let err = node.schedule(None, None).unwrap_err();
+        assert!(err.contains("video slot connected"));
+    }
+
+    #[test]
+    fn connect_input_rejects_duplicate_media_slots() {
+        let mut node = DestinationNode::new(
+            "destination-test".to_string(),
+            DestinationFamily::LocalPlayback,
+            true,
+            true,
+        );
+
+        node.connect_input("slot-1", true, true).unwrap();
+        let err = node.connect_input("slot-2", true, false).unwrap_err();
+        assert!(err.contains("already has an audio input slot"));
+
+        let err = node.connect_input("slot-3", false, true).unwrap_err();
+        assert!(err.contains("already has a video input slot"));
+    }
+
+    #[test]
+    fn disconnect_input_clears_only_matching_slot() {
+        let mut node = DestinationNode::new(
+            "destination-test".to_string(),
+            DestinationFamily::LocalPlayback,
+            true,
+            true,
+        );
+
+        node.connect_input("slot-a", true, false).unwrap();
+        node.connect_input("slot-v", false, true).unwrap();
+
+        node.disconnect_input("slot-a");
+        assert!(node.audio_slot_id.is_none());
+        assert_eq!(node.video_slot_id.as_deref(), Some("slot-v"));
+
+        node.disconnect_input("slot-v");
+        assert!(node.video_slot_id.is_none());
+    }
+
+    #[test]
+    fn as_info_reflects_current_slots_and_state() {
+        let mut node = DestinationNode::new(
+            "destination-test".to_string(),
+            DestinationFamily::Udp {
+                host: "127.0.0.1".to_string(),
+            },
+            true,
+            false,
+        );
+
+        node.connect_input("slot-a", true, false).unwrap();
+        node.state = State::Started;
+
+        let info = node.as_info();
+        match info {
+            NodeInfo::Destination(dest) => {
+                assert_eq!(dest.audio_slot_id.as_deref(), Some("slot-a"));
+                assert!(dest.video_slot_id.is_none());
+                assert_eq!(dest.state, State::Started);
+            }
+            other => panic!("expected destination info, got {other:?}"),
+        }
+    }
 }

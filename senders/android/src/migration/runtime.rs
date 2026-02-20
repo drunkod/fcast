@@ -368,10 +368,40 @@ pub fn try_handle_command_json(payload: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migration::protocol::{Command, DestinationFamily};
+    use crate::migration::protocol::{Command, CommandResult, DestinationFamily, ServerMessage};
+    use serde_json::json;
+    use std::io::Write;
+    use std::net::Shutdown;
+    use std::sync::{Mutex as StdMutex, OnceLock};
+    use uuid::Uuid;
+
+    fn test_lock() -> &'static StdMutex<()> {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
+    }
+
+    fn parse_request_from_wire(payload: &[u8]) -> Result<(String, String, Vec<u8>), String> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = payload.to_vec();
+
+        let writer = std::thread::spawn(move || {
+            let mut client = TcpStream::connect(addr).unwrap();
+            client.write_all(&payload).unwrap();
+            client.shutdown(Shutdown::Write).unwrap();
+        });
+
+        let (mut stream, _) = listener.accept().unwrap();
+        let parsed = parse_http_request(&mut stream);
+        writer.join().unwrap();
+        parsed
+    }
 
     #[test]
     fn json_command_roundtrip() {
+        let _guard = test_lock().lock().unwrap();
+        let _ = shutdown_graph_runtime();
+        std::env::remove_var(GRAPH_COMMAND_BIND_ENV);
         start_graph_runtime().unwrap();
 
         let payload = serde_json::to_string(&Command::CreateSource {
@@ -411,7 +441,48 @@ mod tests {
     }
 
     #[test]
+    fn handle_command_json_accepts_controller_payloads() {
+        let _guard = test_lock().lock().unwrap();
+        let _ = shutdown_graph_runtime();
+        std::env::remove_var(GRAPH_COMMAND_BIND_ENV);
+        start_graph_runtime().unwrap();
+
+        let request_id = Uuid::new_v4();
+        let payload = json!({
+            "id": request_id,
+            "command": {
+                "getinfo": {}
+            }
+        })
+        .to_string();
+
+        let response = handle_command_json(&payload).unwrap();
+        let server_message: ServerMessage = serde_json::from_str(&response).unwrap();
+        assert_eq!(server_message.id, Some(request_id));
+        assert!(matches!(server_message.result, CommandResult::Info(_)));
+
+        shutdown_graph_runtime().unwrap();
+    }
+
+    #[test]
+    fn try_handle_command_json_wraps_invalid_payload_errors() {
+        let _guard = test_lock().lock().unwrap();
+        let _ = shutdown_graph_runtime();
+
+        let response = try_handle_command_json("{invalid");
+        let parsed: ServerMessage = serde_json::from_str(&response).unwrap();
+
+        match parsed.result {
+            CommandResult::Error(err) => {
+                assert!(err.contains("Invalid command payload"));
+            }
+            other => panic!("expected command error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn command_http_request_routes_to_command_handler() {
+        let _guard = test_lock().lock().unwrap();
         let payload = serde_json::to_string(&Command::GetInfo { id: None }).unwrap();
         let (status, content_type, body) =
             handle_command_http_request("POST", "/command", payload.as_bytes());
@@ -424,12 +495,82 @@ mod tests {
 
     #[test]
     fn command_http_request_reports_404_for_unknown_path() {
+        let _guard = test_lock().lock().unwrap();
         let (status, _, _) = handle_command_http_request("POST", "/unknown", b"{}");
         assert_eq!(status, "404 Not Found");
     }
 
     #[test]
+    fn command_http_request_supports_health_and_method_checks() {
+        let _guard = test_lock().lock().unwrap();
+
+        let (status, content_type, body) = handle_command_http_request("GET", "/health", b"");
+        assert_eq!(status, "200 OK");
+        assert_eq!(content_type, "application/json");
+        assert_eq!(body, br#"{"status":"ok"}"#.to_vec());
+
+        let (status, _, body) = handle_command_http_request("PUT", "/command", b"{}");
+        assert_eq!(status, "405 Method Not Allowed");
+        assert_eq!(body, br#"{"error":"method not allowed"}"#.to_vec());
+    }
+
+    #[test]
+    fn command_endpoint_bind_env_trims_and_filters_empty_values() {
+        let _guard = test_lock().lock().unwrap();
+
+        std::env::remove_var(GRAPH_COMMAND_BIND_ENV);
+        assert_eq!(command_endpoint_bind_from_env(), None);
+
+        std::env::set_var(GRAPH_COMMAND_BIND_ENV, "   ");
+        assert_eq!(command_endpoint_bind_from_env(), None);
+
+        std::env::set_var(GRAPH_COMMAND_BIND_ENV, " 127.0.0.1:8999 ");
+        assert_eq!(
+            command_endpoint_bind_from_env(),
+            Some("127.0.0.1:8999".to_string())
+        );
+        std::env::remove_var(GRAPH_COMMAND_BIND_ENV);
+    }
+
+    #[test]
+    fn parse_http_request_parses_method_path_and_body() {
+        let _guard = test_lock().lock().unwrap();
+
+        let request =
+            b"POST /command HTTP/1.1\r\nHost: localhost\r\nContent-Length: 7\r\n\r\n{\"a\":1}";
+        let (method, path, body) = parse_request_from_wire(request).unwrap();
+
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/command");
+        assert_eq!(body, b"{\"a\":1}");
+    }
+
+    #[test]
+    fn parse_http_request_rejects_missing_header_terminator() {
+        let _guard = test_lock().lock().unwrap();
+
+        let request = b"POST /command HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n{\"";
+        let err = parse_request_from_wire(request).unwrap_err();
+        assert!(err.contains("missing header terminator"));
+    }
+
+    #[test]
+    fn parse_http_request_rejects_oversized_content_length() {
+        let _guard = test_lock().lock().unwrap();
+
+        let request = format!(
+            "POST /command HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            GRAPH_COMMAND_MAX_REQUEST_SIZE + 1
+        );
+        let err = parse_request_from_wire(request.as_bytes()).unwrap_err();
+        assert!(err.contains("body is too large"));
+    }
+
+    #[test]
     fn legacy_curl_script_payloads_are_compatible() {
+        let _guard = test_lock().lock().unwrap();
+        let _ = shutdown_graph_runtime();
+        std::env::remove_var(GRAPH_COMMAND_BIND_ENV);
         start_graph_runtime().unwrap();
 
         let commands = [

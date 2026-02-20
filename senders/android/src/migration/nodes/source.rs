@@ -607,4 +607,79 @@ mod tests {
         assert_eq!(node.state, State::Stopped);
         assert_eq!(node.pipeline.stage, SourcePipelineStage::Idle);
     }
+
+    #[test]
+    fn consumer_link_bookkeeping_tracks_audio_and_video_links() {
+        let mut node = SourceNode::new(
+            "source-test".to_string(),
+            "https://example.com/stream.mp4".to_string(),
+            true,
+            true,
+        );
+
+        node.add_consumer_link("slot-av", true, true);
+        node.add_consumer_link("slot-a", true, false);
+        node.add_consumer_link("slot-v", false, true);
+
+        assert!(node.audio_consumer_slot_ids.contains("slot-av"));
+        assert!(node.audio_consumer_slot_ids.contains("slot-a"));
+        assert!(node.video_consumer_slot_ids.contains("slot-av"));
+        assert!(node.video_consumer_slot_ids.contains("slot-v"));
+
+        node.remove_consumer_link("slot-av");
+        assert!(!node.audio_consumer_slot_ids.contains("slot-av"));
+        assert!(!node.video_consumer_slot_ids.contains("slot-av"));
+    }
+
+    #[test]
+    fn advance_schedule_enters_starting_during_preroll_window() {
+        let mut node = SourceNode::new(
+            "source-test".to_string(),
+            "https://example.com/stream.mp4".to_string(),
+            true,
+            true,
+        );
+
+        let cue = Utc::now() + Duration::seconds(20);
+        node.cue_time = Some(cue);
+        node.state = State::Initial;
+
+        node.advance_schedule(cue - Duration::seconds(15));
+        assert_eq!(node.state, State::Initial);
+        assert_eq!(node.pipeline.stage, SourcePipelineStage::Idle);
+
+        node.advance_schedule(cue - Duration::seconds(5));
+        assert_eq!(node.state, State::Starting);
+        assert_eq!(node.pipeline.stage, SourcePipelineStage::Prerolling);
+    }
+
+    #[test]
+    fn as_info_returns_current_state_and_slots() {
+        let mut node = SourceNode::new(
+            "source-test".to_string(),
+            "https://example.com/stream.mp4".to_string(),
+            true,
+            true,
+        );
+        node.state = State::Started;
+        node.add_consumer_link("slot-a", true, false);
+        node.add_consumer_link("slot-v", false, true);
+
+        let info = node.as_info();
+        match info {
+            NodeInfo::Source(source) => {
+                assert_eq!(source.uri, "https://example.com/stream.mp4");
+                assert_eq!(source.state, State::Started);
+                assert!(source
+                    .audio_consumer_slot_ids
+                    .unwrap_or_default()
+                    .contains(&"slot-a".to_string()));
+                assert!(source
+                    .video_consumer_slot_ids
+                    .unwrap_or_default()
+                    .contains(&"slot-v".to_string()));
+            }
+            other => panic!("expected source info, got {other:?}"),
+        }
+    }
 }

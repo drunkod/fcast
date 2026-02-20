@@ -343,3 +343,86 @@ impl VideoGeneratorNode {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schedule_without_gstreamer_init_keeps_state_machine_behavior() {
+        let mut node = VideoGeneratorNode::new("video-gen-test".to_string());
+
+        assert!(node.schedule(None, None).is_ok());
+        assert_eq!(node.state, State::Started);
+        assert_eq!(node.pipeline.stage, VideoGeneratorStage::Playing);
+        assert!(node.live_pipeline.is_none());
+
+        let cue = Utc::now() + Duration::seconds(30);
+        assert!(node.schedule(Some(cue), None).is_ok());
+        assert_eq!(node.state, State::Initial);
+        assert_eq!(node.pipeline.stage, VideoGeneratorStage::Idle);
+        assert!(node.live_pipeline.is_none());
+    }
+
+    #[test]
+    fn advance_schedule_transitions_through_preroll_play_and_stop() {
+        let mut node = VideoGeneratorNode::new("video-gen-test".to_string());
+        let cue = Utc::now() + Duration::seconds(20);
+        let end = cue + Duration::seconds(5);
+        node.cue_time = Some(cue);
+        node.end_time = Some(end);
+        node.state = State::Initial;
+
+        node.advance_schedule(cue - Duration::seconds(11));
+        assert_eq!(node.state, State::Initial);
+        assert_eq!(node.pipeline.stage, VideoGeneratorStage::Idle);
+
+        node.advance_schedule(cue - Duration::seconds(9));
+        assert_eq!(node.state, State::Starting);
+        assert_eq!(node.pipeline.stage, VideoGeneratorStage::Prerolling);
+
+        node.advance_schedule(cue + Duration::seconds(1));
+        assert_eq!(node.state, State::Started);
+        assert_eq!(node.pipeline.stage, VideoGeneratorStage::Playing);
+
+        node.advance_schedule(end + Duration::seconds(1));
+        assert_eq!(node.state, State::Stopped);
+        assert_eq!(node.pipeline.stage, VideoGeneratorStage::Idle);
+    }
+
+    #[test]
+    fn consumer_link_bookkeeping_tracks_audio_and_video() {
+        let mut node = VideoGeneratorNode::new("video-gen-test".to_string());
+        node.add_consumer_link("slot-audio-video", true, true);
+        node.add_consumer_link("slot-video", false, true);
+
+        assert!(node.audio_consumer_slot_ids.contains("slot-audio-video"));
+        assert!(node.video_consumer_slot_ids.contains("slot-audio-video"));
+        assert!(node.video_consumer_slot_ids.contains("slot-video"));
+
+        node.remove_consumer_link("slot-audio-video");
+        assert!(!node.audio_consumer_slot_ids.contains("slot-audio-video"));
+        assert!(!node.video_consumer_slot_ids.contains("slot-audio-video"));
+        assert!(node.video_consumer_slot_ids.contains("slot-video"));
+    }
+
+    #[test]
+    fn compatible_info_uses_source_shape_and_uri_scheme() {
+        let mut node = VideoGeneratorNode::new("video-gen-test".to_string());
+        node.add_consumer_link("slot-1", false, true);
+        node.state = State::Started;
+
+        let info = node.as_compatible_source_info();
+        match info {
+            NodeInfo::Source(source) => {
+                assert_eq!(source.uri, "videogenerator://video-gen-test");
+                assert_eq!(source.state, State::Started);
+                assert_eq!(
+                    source.video_consumer_slot_ids.unwrap_or_default(),
+                    vec!["slot-1".to_string()]
+                );
+            }
+            other => panic!("expected source node info, got {other:?}"),
+        }
+    }
+}

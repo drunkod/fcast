@@ -1309,6 +1309,7 @@ impl MixerNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn schedule_without_gstreamer_init_keeps_state_machine_behavior() {
@@ -1324,5 +1325,174 @@ mod tests {
         assert!(node.schedule(Some(cue), None).is_ok());
         assert_eq!(node.state, State::Initial);
         assert!(node.live_pipeline.is_none());
+    }
+
+    #[test]
+    fn new_rejects_invalid_setting_types() {
+        let config = HashMap::from([("width".to_string(), json!("wide"))]);
+        let err = MixerNode::new("mixer-test".to_string(), Some(config), true, true).unwrap_err();
+        assert!(err.contains("expects a numeric value"));
+    }
+
+    #[test]
+    fn connect_input_slot_applies_defaults_and_custom_values() {
+        let mut node = MixerNode::new("mixer-test".to_string(), None, true, true).unwrap();
+        let slot_config = HashMap::from([
+            ("video::x".to_string(), json!(20)),
+            ("audio::volume".to_string(), json!(0.4)),
+        ]);
+
+        node.connect_input_slot("slot-1", true, true, Some(slot_config))
+            .unwrap();
+
+        let slot = node.slots.get("slot-1").unwrap();
+        assert!((slot.volume - 0.4).abs() < 0.0001);
+
+        let settings = node.slot_settings.get("slot-1").unwrap();
+        assert_eq!(settings.get("video::x"), Some(&json!(20)));
+        assert_eq!(settings.get("audio::volume"), Some(&json!(0.4)));
+        assert!(settings.contains_key("video::width"));
+        assert!(settings.contains_key("video::height"));
+    }
+
+    #[test]
+    fn connect_input_slot_validates_slot_config_keys_and_media() {
+        let mut node = MixerNode::new("mixer-test".to_string(), None, true, true).unwrap();
+
+        let bad_format = HashMap::from([("x".to_string(), json!(10))]);
+        let err = node
+            .connect_input_slot("slot-1", true, true, Some(bad_format))
+            .unwrap_err();
+        assert!(err.contains("must be in form media-type::property-name"));
+
+        let bad_media = HashMap::from([("video::x".to_string(), json!(10))]);
+        let err = node
+            .connect_input_slot("slot-2", true, false, Some(bad_media))
+            .unwrap_err();
+        assert!(err.contains("video is not enabled"));
+
+        let bad_value = HashMap::from([("audio::volume".to_string(), json!("loud"))]);
+        let err = node
+            .connect_input_slot("slot-3", true, false, Some(bad_value))
+            .unwrap_err();
+        assert!(err.contains("expects a numeric value"));
+    }
+
+    #[test]
+    fn add_and_remove_control_point_updates_mixer_setting() {
+        let mut node = MixerNode::new("mixer-test".to_string(), None, true, true).unwrap();
+        let cp = ControlPoint {
+            id: "cp-width".to_string(),
+            time: Utc::now() - Duration::seconds(1),
+            value: json!(1280),
+            mode: crate::migration::protocol::ControlMode::Set,
+        };
+
+        node.add_control_point("width", cp).unwrap();
+        assert_eq!(node.settings.get("width"), Some(&json!(1280)));
+        assert_eq!(node.control_points.get("width").map(Vec::len), Some(1));
+
+        node.remove_control_point("cp-width", "width");
+        assert_eq!(node.control_points.get("width").map(Vec::len), Some(0));
+    }
+
+    #[test]
+    fn add_control_point_rejects_unknown_property() {
+        let mut node = MixerNode::new("mixer-test".to_string(), None, true, true).unwrap();
+        let cp = ControlPoint {
+            id: "cp-unknown".to_string(),
+            time: Utc::now(),
+            value: json!(1),
+            mode: crate::migration::protocol::ControlMode::Set,
+        };
+
+        let err = node.add_control_point("not-a-setting", cp).unwrap_err();
+        assert!(err.contains("has no setting"));
+    }
+
+    #[test]
+    fn slot_control_points_update_slot_volume_and_can_be_removed() {
+        let mut node = MixerNode::new("mixer-test".to_string(), None, true, false).unwrap();
+        node.connect_input_slot("slot-1", true, false, None)
+            .unwrap();
+
+        let cp = ControlPoint {
+            id: "cp-vol".to_string(),
+            time: Utc::now() - Duration::seconds(1),
+            value: json!(0.2),
+            mode: crate::migration::protocol::ControlMode::Set,
+        };
+        node.add_slot_control_point("slot-1", "audio::volume", cp)
+            .unwrap();
+
+        let slot = node.slots.get("slot-1").unwrap();
+        assert!((slot.volume - 0.2).abs() < 0.0001);
+        assert_eq!(
+            node.slot_control_points
+                .get("slot-1")
+                .and_then(|entry| entry.get("audio::volume"))
+                .map(Vec::len),
+            Some(1)
+        );
+
+        node.remove_slot_control_point("cp-vol", "slot-1", "audio::volume");
+        assert_eq!(
+            node.slot_control_points
+                .get("slot-1")
+                .and_then(|entry| entry.get("audio::volume"))
+                .map(Vec::len),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn output_consumer_bookkeeping_tracks_links() {
+        let mut node = MixerNode::new("mixer-test".to_string(), None, true, true).unwrap();
+        node.connect_output_consumer("out-av", true, true);
+        node.connect_output_consumer("out-a", true, false);
+
+        assert!(node.audio_consumer_slot_ids.contains("out-av"));
+        assert!(node.audio_consumer_slot_ids.contains("out-a"));
+        assert!(node.video_consumer_slot_ids.contains("out-av"));
+
+        node.disconnect_output_consumer("out-av");
+        assert!(!node.audio_consumer_slot_ids.contains("out-av"));
+        assert!(!node.video_consumer_slot_ids.contains("out-av"));
+    }
+
+    #[test]
+    fn disconnect_input_slot_removes_slot_models() {
+        let mut node = MixerNode::new("mixer-test".to_string(), None, true, true).unwrap();
+        node.connect_input_slot("slot-1", true, true, None).unwrap();
+        assert!(node.slots.contains_key("slot-1"));
+        assert!(node.slot_settings.contains_key("slot-1"));
+        assert!(node.slot_control_points.contains_key("slot-1"));
+
+        node.disconnect_input_slot("slot-1");
+        assert!(!node.slots.contains_key("slot-1"));
+        assert!(!node.slot_settings.contains_key("slot-1"));
+        assert!(!node.slot_control_points.contains_key("slot-1"));
+    }
+
+    #[test]
+    fn as_info_contains_mixer_slots_and_control_maps() {
+        let mut node = MixerNode::new("mixer-test".to_string(), None, true, true).unwrap();
+        node.connect_input_slot("slot-1", true, true, None).unwrap();
+        node.connect_output_consumer("out-1", true, true);
+        node.state = State::Started;
+
+        let info = node.as_info();
+        match info {
+            NodeInfo::Mixer(mixer) => {
+                assert_eq!(mixer.state, State::Started);
+                assert!(mixer.slots.contains_key("slot-1"));
+                assert!(mixer.slot_settings.contains_key("slot-1"));
+                assert!(mixer
+                    .audio_consumer_slot_ids
+                    .unwrap_or_default()
+                    .contains(&"out-1".to_string()));
+            }
+            other => panic!("expected mixer info, got {other:?}"),
+        }
     }
 }
