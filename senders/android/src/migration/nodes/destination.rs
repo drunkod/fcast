@@ -2,6 +2,7 @@ use crate::migration::protocol::{DestinationFamily, DestinationInfo, NodeInfo, S
 use chrono::{DateTime, Duration, Utc};
 use gst::prelude::*;
 use gst_app::AppSrc;
+use tracing::{error, info, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DestinationPipelineStage {
@@ -162,6 +163,75 @@ impl DestinationNode {
         appsrc.set_property_from_str("format", "time");
         appsrc.set_property("block", false);
         Ok(appsrc)
+    }
+
+    fn make_first_available_element(
+        candidates: &[&str],
+        name: Option<&str>,
+        purpose: &str,
+    ) -> Result<gst::Element, String> {
+        let mut failures = Vec::new();
+        for (idx, candidate) in candidates.iter().enumerate() {
+            match Self::make_element(candidate, name) {
+                Ok(element) => {
+                    if *candidate == "fakesink" {
+                        error!(
+                            purpose = %purpose,
+                            element = %candidate,
+                            "All real sink candidates failed; using fakesink (no output)"
+                        );
+                    } else if idx == 0 {
+                        info!(purpose = %purpose, element = %candidate, "Using GStreamer element");
+                    } else {
+                        warn!(
+                            purpose = %purpose,
+                            element = %candidate,
+                            "Using fallback GStreamer element"
+                        );
+                    }
+                    return Ok(element);
+                }
+                Err(err) => failures.push(format!("{candidate}: {err}")),
+            }
+        }
+
+        Err(format!(
+            "Failed to create {purpose}. Attempted elements: {}",
+            failures.join(" | ")
+        ))
+    }
+
+    fn make_local_video_sink(id: &str) -> Result<gst::Element, String> {
+        #[cfg(target_os = "android")]
+        const CANDIDATES: &[&str] = &["glimagesink", "autovideosink", "fakesink"];
+        #[cfg(not(target_os = "android"))]
+        const CANDIDATES: &[&str] = &["autovideosink", "glimagesink", "fakesink"];
+
+        let sink_name = format!("destination-video-sink-{id}");
+        Self::make_first_available_element(
+            CANDIDATES,
+            Some(&sink_name),
+            "local playback video sink",
+        )
+    }
+
+    fn make_local_audio_sink(id: &str) -> Result<gst::Element, String> {
+        #[cfg(target_os = "android")]
+        const CANDIDATES: &[&str] = &[
+            "openslessink",
+            "autoaudiosink",
+            "audiotracksink",
+            "fakesink",
+        ];
+        #[cfg(not(target_os = "android"))]
+        const CANDIDATES: &[&str] = &["autoaudiosink", "pulsesink", "alsasink", "fakesink"];
+
+        let sink_name = format!("destination-audio-sink-{id}");
+        Self::make_first_available_element(
+            CANDIDATES,
+            Some(&sink_name),
+            "local playback audio sink",
+        )
     }
 
     fn select_video_encoder(id: &str) -> Result<gst::Element, String> {
@@ -507,7 +577,7 @@ impl DestinationNode {
                 if let Some(appsrc) = video_appsrc.as_ref() {
                     let vqueue = Self::make_element("queue", None)?;
                     let vconv = Self::make_element("videoconvert", None)?;
-                    let vsink = Self::make_element("autovideosink", None)?;
+                    let vsink = Self::make_local_video_sink(&self.id)?;
 
                     pipeline.add(&vqueue).map_err(|err| {
                         format!("Failed to add video queue to local-playback pipeline: {err:?}")
@@ -516,7 +586,7 @@ impl DestinationNode {
                         format!("Failed to add videoconvert to local-playback pipeline: {err:?}")
                     })?;
                     pipeline.add(&vsink).map_err(|err| {
-                        format!("Failed to add autovideosink to local-playback pipeline: {err:?}")
+                        format!("Failed to add video sink to local-playback pipeline: {err:?}")
                     })?;
 
                     gst::Element::link_many(
@@ -529,7 +599,7 @@ impl DestinationNode {
                     let aqueue = Self::make_element("queue", None)?;
                     let aconv = Self::make_element("audioconvert", None)?;
                     let aresample = Self::make_element("audioresample", None)?;
-                    let asink = Self::make_element("autoaudiosink", None)?;
+                    let asink = Self::make_local_audio_sink(&self.id)?;
 
                     pipeline.add(&aqueue).map_err(|err| {
                         format!("Failed to add audio queue to local-playback pipeline: {err:?}")
@@ -541,7 +611,7 @@ impl DestinationNode {
                         format!("Failed to add audioresample to local-playback pipeline: {err:?}")
                     })?;
                     pipeline.add(&asink).map_err(|err| {
-                        format!("Failed to add autoaudiosink to local-playback pipeline: {err:?}")
+                        format!("Failed to add audio sink to local-playback pipeline: {err:?}")
                     })?;
 
                     gst::Element::link_many(

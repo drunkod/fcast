@@ -6,6 +6,7 @@ use gst::prelude::*;
 use gst_app::{AppSink, AppSrc};
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
+use tracing::warn;
 
 const PREROLL_LEAD_TIME_SECONDS: i64 = 10;
 
@@ -325,10 +326,7 @@ impl MixerNode {
         value: &Value,
     ) -> Result<(), String> {
         let Some(pspec) = pad.find_property(property) else {
-            return Err(format!(
-                "Pad `{}` has no property `{property}`",
-                pad.name()
-            ));
+            return Err(format!("Pad `{}` has no property `{property}`", pad.name()));
         };
 
         let expected_type = pspec.value_type();
@@ -394,6 +392,29 @@ impl MixerNode {
         }
     }
 
+    fn resolve_video_pad_property_name(pad: &gst::Pad, property: &str) -> Option<String> {
+        if pad.find_property(property).is_some() {
+            return Some(property.to_string());
+        }
+
+        let alias = match property {
+            // Legacy compositor payloads use x/y while modern compositor pads often expose xpos/ypos.
+            "x" => Some("xpos"),
+            "y" => Some("ypos"),
+            "xpos" => Some("x"),
+            "ypos" => Some("y"),
+            _ => None,
+        };
+
+        if let Some(alias_property) = alias {
+            if pad.find_property(alias_property).is_some() {
+                return Some(alias_property.to_string());
+            }
+        }
+
+        None
+    }
+
     fn set_pad_property_safe<T: Into<gst::glib::Value>>(
         pad: &gst::Pad,
         property: &str,
@@ -443,7 +464,15 @@ impl MixerNode {
                 // Kept for legacy payload compatibility even when compositor pad does not expose this property.
                 continue;
             }
-            Self::set_dynamic_pad_property(pad, prop, value)?;
+            if let Some(resolved_prop) = Self::resolve_video_pad_property_name(pad, prop) {
+                Self::set_dynamic_pad_property(pad, &resolved_prop, value)?;
+            } else {
+                warn!(
+                    pad = %pad.name(),
+                    property = %prop,
+                    "Ignoring unsupported video pad property"
+                );
+            }
         }
         Ok(())
     }

@@ -10,12 +10,10 @@ use mcore::{transmission::WhepSink, DeviceEvent, Event, ShouldQuit, SourceConfig
 use parking_lot::{Condvar, Mutex};
 #[cfg(target_os = "android")]
 use serde_json::{json, Value};
-use std::{
-    collections::HashMap,
-    net::Ipv6Addr,
-    sync::Arc,
-};
+use std::{collections::HashMap, net::Ipv6Addr, sync::Arc};
 use tracing::{debug, error};
+#[cfg(target_os = "android")]
+use tracing::{info, warn};
 
 pub mod migration;
 
@@ -119,10 +117,7 @@ fn start_migrated_command_server(bind_addr: &str) -> std::result::Result<String,
 }
 
 #[cfg(target_os = "android")]
-fn run_graph_http_command(
-    bind_addr: &str,
-    payload: Value,
-) -> std::result::Result<Value, String> {
+fn run_graph_http_command(bind_addr: &str, payload: Value) -> std::result::Result<Value, String> {
     let payload_json = payload.to_string();
     let body = send_http_request(bind_addr, "POST", "/command", Some(&payload_json))?;
     let response: Value = serde_json::from_str(&body)
@@ -157,7 +152,9 @@ fn run_graph_command(action: &str, params: Value) -> std::result::Result<Value, 
                 Ok(result)
             }
         }
-        _ => Err(format!("{action} unsupported result shape: {response_json}")),
+        _ => Err(format!(
+            "{action} unsupported result shape: {response_json}"
+        )),
     }
 }
 
@@ -408,6 +405,15 @@ fn run_graph_smoke_test() -> String {
     match result {
         Ok(success) => format!("PASS {success}"),
         Err(err) => format!("FAIL {err}"),
+    }
+}
+
+#[cfg(target_os = "android")]
+fn log_ui_test_status(test_name: &'static str, status: &str) {
+    if status.starts_with("PASS") {
+        info!(test = test_name, status = status, "UI test completed");
+    } else {
+        warn!(test = test_name, status = status, "UI test failed");
     }
 }
 
@@ -942,6 +948,7 @@ fn android_main(app: PlatformApp) {
                 Ok(message) => format!("PASS {message}"),
                 Err(err) => format!("FAIL {err}"),
             };
+            log_ui_test_status("start-migrated-server", &status);
             if let Err(err) = ui_weak.upgrade_in_event_loop(move |ui| {
                 ui.global::<Bridge>().set_test_status(status.into());
             }) {
@@ -963,6 +970,7 @@ fn android_main(app: PlatformApp) {
             let ui_weak_for_result = ui_weak.clone();
             std::thread::spawn(move || {
                 let status = run_legacy_http_getinfo_test(LEGACY_COMMAND_BIND_ADDR);
+                log_ui_test_status("legacy-getinfo", &status);
                 if let Err(err) = ui_weak_for_result.upgrade_in_event_loop(move |ui| {
                     ui.global::<Bridge>().set_test_status(status.into());
                 }) {
@@ -985,6 +993,7 @@ fn android_main(app: PlatformApp) {
             let ui_weak_for_result = ui_weak.clone();
             std::thread::spawn(move || {
                 let status = run_legacy_http_crossfade_test(LEGACY_COMMAND_BIND_ADDR);
+                log_ui_test_status("legacy-crossfade", &status);
                 if let Err(err) = ui_weak_for_result.upgrade_in_event_loop(move |ui| {
                     ui.global::<Bridge>().set_test_status(status.into());
                 }) {
@@ -1007,6 +1016,7 @@ fn android_main(app: PlatformApp) {
             let ui_weak_for_result = ui_weak.clone();
             std::thread::spawn(move || {
                 let status = run_graph_smoke_test();
+                log_ui_test_status("graph-smoke", &status);
                 if let Err(err) = ui_weak_for_result.upgrade_in_event_loop(move |ui| {
                     ui.global::<Bridge>().set_test_status(status.into());
                 }) {
