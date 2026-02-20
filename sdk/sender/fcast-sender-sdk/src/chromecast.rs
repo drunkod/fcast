@@ -518,8 +518,12 @@ impl InnerDevice {
                                     if !shared_state.is_running {
                                         self.event_handler.connection_state_changed(
                                             DeviceConnectionState::Connected {
-                                                used_remote_addr: shared_state.remote_sockaddr.into(),
-                                                local_addr: shared_state.stream_local_sockaddr.into(),
+                                                used_remote_addr: shared_state
+                                                    .remote_sockaddr
+                                                    .into(),
+                                                local_addr: shared_state
+                                                    .stream_local_sockaddr
+                                                    .into(),
                                             },
                                         );
                                     }
@@ -572,8 +576,9 @@ impl InnerDevice {
                                             ..
                                         } => crate::device::Metadata {
                                             title,
-                                            thumbnail_url: images
-                                                .and_then(|imgs| imgs.first().map(|img| img.url.clone())),
+                                            thumbnail_url: images.and_then(|imgs| {
+                                                imgs.first().map(|img| img.url.clone())
+                                            }),
                                         },
                                     }),
                                 });

@@ -113,7 +113,10 @@ impl ReceiverArgs {
                         );
                         let _env_gst_java_src_dir = sh.push_env(
                             "GSTREAMER_JAVA_SRC_DIR",
-                            concat_path(&root_path, "receivers/experimental/android/app/src/main/java"),
+                            concat_path(
+                                &root_path,
+                                "receivers/experimental/android/app/src/main/java",
+                            ),
                         );
                         let _env_ndk_project_path = sh.push_env(
                             "NDK_PROJECT_PATH",
@@ -131,8 +134,10 @@ impl ReceiverArgs {
                         cmd!(sh, "make -f {ndk_root}/build/core/build-local.mk").run()?;
                     }
                     AndroidReceiverCommand::Build { release, target } => {
-                        let out_dir =
-                            concat_path(&root_path, "receivers/experimental/android/app/src/main/jniLibs");
+                        let out_dir = concat_path(
+                            &root_path,
+                            "receivers/experimental/android/app/src/main/jniLibs",
+                        );
 
                         let targets = target.map(|t| vec![t]).unwrap_or(vec![
                             AndroidAbiTarget::X64,
