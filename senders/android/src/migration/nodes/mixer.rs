@@ -486,7 +486,15 @@ impl MixerNode {
                 continue;
             }
             let prop = key.trim_start_matches("audio::");
-            Self::set_dynamic_pad_property(pad, prop, value)?;
+            if pad.find_property(prop).is_some() {
+                Self::set_dynamic_pad_property(pad, prop, value)?;
+            } else {
+                warn!(
+                    pad = %pad.name(),
+                    property = %prop,
+                    "Ignoring unsupported audio pad property"
+                );
+            }
         }
         Ok(())
     }

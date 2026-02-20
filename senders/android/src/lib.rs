@@ -11,6 +11,8 @@ use parking_lot::{Condvar, Mutex};
 #[cfg(target_os = "android")]
 use serde_json::{json, Value};
 use std::{collections::HashMap, net::Ipv6Addr, sync::Arc};
+#[cfg(target_os = "android")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, error};
 #[cfg(target_os = "android")]
 use tracing::{info, warn};
@@ -31,6 +33,9 @@ lazy_static::lazy_static! {
     pub static ref FRAME_POOL: Mutex<gst_video::VideoBufferPool> = Mutex::new(gst_video::VideoBufferPool::new());
 }
 
+#[cfg(target_os = "android")]
+static CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 slint::include_modules!();
 
 macro_rules! log_err {
@@ -45,6 +50,34 @@ macro_rules! log_err {
 const MIGRATION_COMMAND_BIND_ENV: &str = "MIGRATION_COMMAND_BIND";
 #[cfg(target_os = "android")]
 const LEGACY_COMMAND_BIND_ADDR: &str = "0.0.0.0:8080";
+
+#[cfg(target_os = "android")]
+fn ensure_gstreamer_initialized() -> std::result::Result<(), String> {
+    use std::sync::OnceLock;
+
+    static GST_INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    GST_INIT
+        .get_or_init(|| {
+            gst::init().map_err(|err| format!("Failed to initialize GStreamer: {err}"))
+        })
+        .clone()
+}
+
+#[cfg(not(target_os = "android"))]
+fn ensure_gstreamer_initialized() -> std::result::Result<(), String> {
+    gst::init().map_err(|err| format!("Failed to initialize GStreamer: {err}"))
+}
+
+#[cfg(target_os = "android")]
+fn set_capture_active(active: bool) {
+    CAPTURE_ACTIVE.store(active, Ordering::SeqCst);
+    if !active {
+        let (lock, cvar) = &*FRAME_PAIR;
+        let mut frame = lock.lock();
+        *frame = None;
+        cvar.notify_all();
+    }
+}
 
 #[cfg(target_os = "android")]
 fn command_probe_addr(bind_addr: &str) -> String {
@@ -106,6 +139,7 @@ fn send_http_request(
 
 #[cfg(target_os = "android")]
 fn start_migrated_command_server(bind_addr: &str) -> std::result::Result<String, String> {
+    ensure_gstreamer_initialized()?;
     std::env::set_var(MIGRATION_COMMAND_BIND_ENV, bind_addr);
     crate::migration::runtime::start_graph_runtime()
         .map_err(|err| format!("Failed to start migrated graph runtime: {err}"))?;
@@ -692,9 +726,12 @@ impl Application {
                 }
             }
             #[cfg(target_os = "android")]
-            Event::CaptureStopped => (),
+            Event::CaptureStopped => {
+                set_capture_active(false);
+            }
             #[cfg(target_os = "android")]
             Event::CaptureCancelled => {
+                set_capture_active(false);
                 self.ui_weak.upgrade_in_event_loop(|ui| {
                     ui.global::<Bridge>()
                         .invoke_change_state(AppState::Disconnected);
@@ -715,6 +752,7 @@ impl Application {
             }
             #[cfg(target_os = "android")]
             Event::CaptureStarted => {
+                set_capture_active(true);
                 let appsrc = gst_app::AppSrc::builder()
                     .caps(
                         &gst_video::VideoCapsBuilder::new()
@@ -735,11 +773,18 @@ impl Application {
                             let frame = {
                                 let (lock, cvar) = &*FRAME_PAIR;
                                 let mut frame = lock.lock();
-                                while (*frame).is_none() {
-                                    cvar.wait(&mut frame);
+                                while (*frame).is_none()
+                                    && CAPTURE_ACTIVE.load(Ordering::SeqCst)
+                                {
+                                    cvar.wait_for(&mut frame, std::time::Duration::from_millis(100));
                                 }
-
-                                (*frame).take().unwrap()
+                                (*frame).take()
+                            };
+                            let Some(frame) = frame else {
+                                if !CAPTURE_ACTIVE.load(Ordering::SeqCst) {
+                                    let _ = appsrc.end_of_stream();
+                                }
+                                return;
                             };
 
                             use gst_video::prelude::*;
@@ -857,7 +902,8 @@ impl Application {
         tracing_gstreamer::integrate_events();
         gst::log::remove_default_log_function();
         gst::log::set_default_threshold(gst::DebugLevel::Fixme);
-        gst::init().unwrap();
+        ensure_gstreamer_initialized()
+            .map_err(|err| anyhow::anyhow!("Failed to initialize GStreamer: {err}"))?;
         debug!("GStreamer version: {:?}", gst::version());
         if let Err(err) = crate::migration::runtime::start_graph_runtime() {
             error!(?err, "Failed to start migrated graph runtime");
@@ -1040,9 +1086,13 @@ fn android_main(app: PlatformApp) {
 
     ui.run().unwrap();
 
-    runtime.spawn(async move {
-        event_tx.send(Event::Quit).unwrap();
-        app_jh.await.unwrap();
+    runtime.block_on(async move {
+        if let Err(err) = event_tx.send(Event::Quit) {
+            error!(?err, "Failed to send quit event");
+        }
+        if let Err(err) = app_jh.await {
+            error!(?err, "Android application task join failed");
+        }
     });
 
     debug!("Finished");
@@ -1328,15 +1378,23 @@ fn process_frame<'local>(
     }
 
     let mut frame_pool = FRAME_POOL.lock();
-    let old_config = frame_pool.config();
     let frame_size = width * height + 2 * ((width / 2) * (height / 2));
-    if !frame_pool.is_active() {
-        init_frame_pool(&frame_pool, old_config, &new_caps, frame_size as u32)?;
+    let needs_reconfigure = if !frame_pool.is_active() {
+        true
     } else {
-        let _ = frame_pool.set_active(false);
-        let new_frame_pool = gst_video::VideoBufferPool::new();
-        init_frame_pool(&new_frame_pool, old_config, &new_caps, frame_size as u32)?;
-        *frame_pool = new_frame_pool;
+        match frame_pool.config().params() {
+            Some((caps, size, _, _)) => {
+                caps.as_ref() != Some(&new_caps) || size != frame_size as u32
+            }
+            None => true,
+        }
+    };
+    if needs_reconfigure {
+        let old_config = frame_pool.config();
+        if frame_pool.is_active() {
+            let _ = frame_pool.set_active(false);
+        }
+        init_frame_pool(&frame_pool, old_config, &new_caps, frame_size as u32)?;
     }
 
     let buffer = match frame_pool.acquire_buffer(None) {

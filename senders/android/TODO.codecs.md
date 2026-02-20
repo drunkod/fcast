@@ -75,7 +75,7 @@ let sink = Self::make_element("rtmp2sink", None)
 - [ ] When using `uridecodebin` fallback, implement manual reconnection logic on pipeline bus errors (the app loses automatic recovery that `fallbacksrc` provides).
 - [ ] Add a periodic health-check in `poll_bus_messages()` that detects stream stalls and triggers pipeline rebuild.
 - [ ] Consider `uridecodebin3` as a middle-ground fallback (better gap handling than `uridecodebin`, available in prebuilt).
-- [ ] Remove the `manual_unblock` and `immediate_fallback` property sets when `uses_fallbacksrc` is false - currently dead code on that path.
+- [ ] Audit the fallbacksrc-only property sets (`manual_unblock`, `immediate_fallback`) and keep them strictly inside the fallbacksrc code path. Current code already scopes them to fallbacksrc, so this is a regression guard.
 
 ---
 
@@ -155,13 +155,13 @@ If any `gst-plugins-rs` elements are cross-compiled and statically linked, they 
 
 ```rust
 fn discover_h264_encoder() -> Result<gst::Element, String> {
-    let factories = gst::ElementFactory::factories_with_type(
-        gst::ElementFactoryType::VIDEO_ENCODER,
+    let factories = gst::ElementFactory::list_get_elements(
+        gst::ElementFactoryListType::ENCODER | gst::ElementFactoryListType::MEDIA_VIDEO,
         gst::Rank::MARGINAL,
     );
     for factory in factories {
         if factory.can_src_any_caps(&gst::Caps::builder("video/x-h264").build()) {
-            if let Ok(elem) = factory.create().build() {
+            if let Ok(elem) = factory.create().name("destination-venc").build() {
                 return Ok(elem);
             }
         }

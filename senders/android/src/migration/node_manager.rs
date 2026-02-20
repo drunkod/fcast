@@ -302,6 +302,9 @@ impl NodeManager {
 
     pub fn shutdown(&mut self) {
         self.started = false;
+        for node in self.nodes.values_mut() {
+            node.stop();
+        }
         self.nodes.clear();
         self.links.clear();
         for bridge in self.media_bridges.values_mut() {

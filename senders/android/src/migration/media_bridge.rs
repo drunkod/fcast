@@ -8,6 +8,7 @@ use std::sync::Arc;
 pub struct StreamBridge {
     consumers: Arc<Mutex<HashMap<String, AppSrc>>>,
     attached_sink: Option<AppSink>,
+    last_caps: Arc<Mutex<Option<gst::Caps>>>,
 }
 
 impl StreamBridge {
@@ -15,6 +16,9 @@ impl StreamBridge {
         self.consumers
             .lock()
             .insert(consumer_id.to_string(), consumer.clone());
+        if let Some(caps) = self.last_caps.lock().as_ref().cloned() {
+            consumer.set_caps(Some(&caps));
+        }
     }
 
     pub fn remove_consumer(&mut self, consumer_id: &str) {
@@ -23,6 +27,7 @@ impl StreamBridge {
 
     pub fn clear(&mut self) {
         self.consumers.lock().clear();
+        *self.last_caps.lock() = None;
         if let Some(sink) = self.attached_sink.take() {
             sink.set_callbacks(AppSinkCallbacks::builder().build());
         }
@@ -45,13 +50,19 @@ impl StreamBridge {
             old_sink.set_callbacks(AppSinkCallbacks::builder().build());
         }
 
-        Self::configure_callbacks(sink, self.consumers.clone());
+        *self.last_caps.lock() = None;
+        Self::configure_callbacks(sink, self.consumers.clone(), self.last_caps.clone());
         self.attached_sink = Some(sink.clone());
     }
 
-    fn configure_callbacks(sink: &AppSink, consumers: Arc<Mutex<HashMap<String, AppSrc>>>) {
+    fn configure_callbacks(
+        sink: &AppSink,
+        consumers: Arc<Mutex<HashMap<String, AppSrc>>>,
+        last_caps: Arc<Mutex<Option<gst::Caps>>>,
+    ) {
         let consumers_for_samples = consumers.clone();
         let consumers_for_eos = consumers.clone();
+        let last_caps_for_samples = last_caps;
 
         sink.set_callbacks(
             AppSinkCallbacks::builder()
@@ -74,9 +85,19 @@ impl StreamBridge {
                         return Ok(gst::FlowSuccess::Ok);
                     }
 
+                    let caps_to_set = caps.as_ref().and_then(|incoming| {
+                        let mut last = last_caps_for_samples.lock();
+                        if last.as_ref() == Some(incoming) {
+                            None
+                        } else {
+                            *last = Some(incoming.clone());
+                            Some(incoming.clone())
+                        }
+                    });
+
                     let mut stale = Vec::new();
                     for (consumer_id, appsrc) in snapshot {
-                        if let Some(caps) = caps.as_ref() {
+                        if let Some(caps) = caps_to_set.as_ref() {
                             appsrc.set_caps(Some(caps));
                         }
 
