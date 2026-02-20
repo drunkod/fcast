@@ -310,7 +310,6 @@ fn run_legacy_http_crossfade_test(bind_addr: &str) -> String {
                     "config": {
                         "video::zorder": 2,
                         "video::alpha": 1.0,
-                        "audio::volume": 1.0,
                         "video::width": 1280,
                         "video::height": 720,
                         "video::sizing-policy": "keep-aspect-ratio"
