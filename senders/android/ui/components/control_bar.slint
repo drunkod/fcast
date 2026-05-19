@@ -28,7 +28,12 @@ export component QuickActionButton inherits Rectangle {
         clicked => { root.invoked(root.action.id); }
     }
     Text {
-        text: root.action.title;
+        // Macro-flagged actions get a ▶ glyph prefix. The quick-action
+        // customisation page (Phase 17) treats id == "macro:<id>" as
+        // shorthand for "this bar entry runs macro <id>".
+        text: root.action.is-macro
+            ? "▶ " + root.action.title
+            : root.action.title;
         color: Theme.text-primary;
         horizontal-alignment: center;
         vertical-alignment: center;
@@ -38,17 +43,6 @@ export component QuickActionButton inherits Rectangle {
 }
 
 export component CastControlBar inherits Rectangle {
-    // UI-only stub model. Phase 8 swaps for `Bridge.quick-actions` driven
-    // by Rust. The spec calls these out as the canonical Phase-7 set:
-    //   settings, debug, codec-test, scan-qr, migrated-server.
-    in-out property <[QuickAction]> mock-quick-actions: [
-        { id: "settings",        title: "Settings",       enabled: true, active: false },
-        { id: "debug",           title: "Debug",          enabled: true, active: false },
-        { id: "codec-test",      title: "Codec test",     enabled: true, active: false },
-        { id: "scan-qr",         title: "Scan QR",        enabled: true, active: false },
-        { id: "migrated-server", title: "Migrated srv",   enabled: true, active: false },
-    ];
-
     height: Theme.control-bar-height;
     background: Theme.surface-bar;
 
@@ -57,13 +51,16 @@ export component CastControlBar inherits Rectangle {
         spacing: Theme.spacing-default;
         alignment: start;
 
-        for action in root.mock-quick-actions: QuickActionButton {
+        for action in Bridge.quick-actions: QuickActionButton {
             action: action;
             invoked(id) => {
                 // Panel-opening ids stay in Slint — no Rust round-trip.
                 if (id == "settings")    { Bridge.active-panel = Panel.settings;   return; }
                 if (id == "debug")       { Bridge.active-panel = Panel.debug;      return; }
                 if (id == "codec-test")  { Bridge.active-panel = Panel.codec-test; return; }
+                if (id == "record")      { Bridge.active-panel = Panel.recording;  return; }
+                if (id == "pair")        { Bridge.active-panel = Panel.pairing;    return; }
+                if (id == "bitrate")     { Bridge.active-panel = Panel.bitrate-presets; return; }
                 // Non-panel ids still go through the Rust handler.
                 Bridge.invoke-action(id);
             }

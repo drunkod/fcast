@@ -267,6 +267,7 @@ dependencies = [
  "fcast-protocol",
  "fcast-sender-sdk",
  "futures-core",
+ "gst-plugin-webrtc",
  "gstreamer 0.25.1",
  "gstreamer-app",
  "gstreamer-video",
@@ -283,6 +284,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-gstreamer",
+ "tracing-subscriber",
  "uuid",
 ]
 

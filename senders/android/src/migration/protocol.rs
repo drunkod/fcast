@@ -6,6 +6,18 @@ fn default_as_true() -> bool {
     true
 }
 
+fn default_capture_width() -> u32 {
+    1280
+}
+
+fn default_capture_height() -> u32 {
+    720
+}
+
+fn default_capture_fps() -> u32 {
+    30
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum ControlMode {
@@ -47,6 +59,15 @@ pub enum Command {
         audio: bool,
         #[serde(default = "default_as_true")]
         video: bool,
+    },
+    CreateScreenCaptureSource {
+        id: String,
+        #[serde(default = "default_capture_width")]
+        width: u32,
+        #[serde(default = "default_capture_height")]
+        height: u32,
+        #[serde(default = "default_capture_fps")]
+        fps: u32,
     },
     CreateDestination {
         id: String,
@@ -135,6 +156,10 @@ pub enum DestinationFamily {
         max_size_time: Option<u32>,
     },
     LocalPlayback,
+    Whep {
+        #[serde(default)]
+        server_port: u16,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,6 +182,10 @@ pub struct DestinationInfo {
     pub cue_time: Option<DateTime<Utc>>,
     pub end_time: Option<DateTime<Utc>>,
     pub state: State,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_port_v4: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_port_v6: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,6 +306,57 @@ mod tests {
     }
 
     #[test]
+    fn whep_destination_serdes_roundtrip() {
+        let original = DestinationFamily::Whep { server_port: 0 };
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: DestinationFamily = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, parsed);
+        assert!(json.starts_with(r#"{"Whep":{"server_port":0"#));
+    }
+
+    #[test]
+    fn whep_destination_default_server_port_when_omitted() {
+        let minimal: DestinationFamily = serde_json::from_str(r#"{"Whep":{}}"#).unwrap();
+        match minimal {
+            DestinationFamily::Whep { server_port } => assert_eq!(server_port, 0),
+            other => panic!("expected Whep variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn whep_destination_info_bound_ports_skipped_when_none() {
+        let info = DestinationInfo {
+            family: DestinationFamily::Whep { server_port: 0 },
+            audio_slot_id: None,
+            video_slot_id: None,
+            cue_time: None,
+            end_time: None,
+            state: State::Initial,
+            bound_port_v4: None,
+            bound_port_v6: None,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(!json.contains("bound_port"));
+    }
+
+    #[test]
+    fn whep_destination_info_bound_ports_emit_when_some() {
+        let info = DestinationInfo {
+            family: DestinationFamily::Whep { server_port: 0 },
+            audio_slot_id: None,
+            video_slot_id: None,
+            cue_time: None,
+            end_time: None,
+            state: State::Initial,
+            bound_port_v4: Some(54321),
+            bound_port_v6: Some(54322),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains(r#""bound_port_v4":54321"#));
+        assert!(json.contains(r#""bound_port_v6":54322"#));
+    }
+
+    #[test]
     fn destination_family_roundtrip_includes_all_variants() {
         let families = [
             DestinationFamily::Rtmp {
@@ -297,6 +377,72 @@ mod tests {
             let decoded: DestinationFamily = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded, family);
         }
+    }
+
+    #[test]
+    fn screen_capture_command_deserialises() {
+        let cmd: Command = serde_json::from_str(
+            r#"{"createscreencapturesource":{"id":"cap-1","width":1280,"height":720,"fps":30}}"#,
+        )
+        .unwrap();
+
+        match cmd {
+            Command::CreateScreenCaptureSource {
+                id,
+                width,
+                height,
+                fps,
+            } => {
+                assert_eq!(id, "cap-1");
+                assert_eq!(width, 1280);
+                assert_eq!(height, 720);
+                assert_eq!(fps, 30);
+            }
+            other => panic!("expected CreateScreenCaptureSource, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn screen_capture_command_uses_defaults_when_omitted() {
+        let cmd: Command =
+            serde_json::from_str(r#"{"createscreencapturesource":{"id":"cap-1"}}"#).unwrap();
+
+        match cmd {
+            Command::CreateScreenCaptureSource {
+                id,
+                width,
+                height,
+                fps,
+            } => {
+                assert_eq!(id, "cap-1");
+                assert_eq!(width, 1280);
+                assert_eq!(height, 720);
+                assert_eq!(fps, 30);
+            }
+            other => panic!("expected CreateScreenCaptureSource, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn screen_capture_command_roundtrips() {
+        let cmd = Command::CreateScreenCaptureSource {
+            id: "cap-1".into(),
+            width: 1920,
+            height: 1080,
+            fps: 60,
+        };
+
+        let json = serde_json::to_string(&cmd).unwrap();
+        let parsed: Command = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Command::CreateScreenCaptureSource {
+                ref id,
+                width: 1920,
+                height: 1080,
+                fps: 60,
+            } if id == "cap-1"
+        ));
     }
 
     #[test]
